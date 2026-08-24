@@ -17,7 +17,6 @@ from typing import Optional
 
 import polars as pl
 import numpy as np
-from tqdm import tqdm
 
 try:
     import bm25s                        # fast BM25 (preferred)
@@ -259,6 +258,11 @@ def evaluate_bm25(
 
     # MIND has a 'history' column; EB-NeRD does not (use pseudo-history)
     has_history = "history" in behaviors.columns
+
+    try:
+        from tqdm import tqdm
+    except ImportError:
+        def tqdm(it, **kw): return it  # fallback: no progress bar
 
     for row in tqdm(behaviors.iter_rows(named=True), total=len(behaviors), desc="BM25 eval"):
         impressions = row["impressions"] or []

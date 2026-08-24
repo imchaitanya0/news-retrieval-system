@@ -24,7 +24,6 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
-from tqdm import tqdm
 
 PROCESSED_DIR = Path("data/processed")
 EMBED_DIR = Path("data/feature_store/embeddings")
@@ -298,6 +297,11 @@ def evaluate_semantic(
     n_no_history = 0
 
     has_history = "history" in behaviors.columns
+
+    try:
+        from tqdm import tqdm
+    except ImportError:
+        def tqdm(it, **kw): return it  # fallback: no progress bar
 
     for row in tqdm(behaviors.iter_rows(named=True), total=len(behaviors), desc="Semantic eval"):
         impressions = row["impressions"] or []
