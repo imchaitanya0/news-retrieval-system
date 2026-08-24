@@ -87,7 +87,9 @@ class BM25Retriever:
 
         if _USE_BM25S:
             self._index = bm25s.BM25(k1=1.5, b=0.75)
-            self._index.index(corpus)
+            # Create bm25s index
+            corpus_tokens = bm25s.tokenize([_article_text(r) for r in texts], lower=True, show_progress=False)
+            self._index.index(corpus_tokens, show_progress=False)
         else:
             self._corpus_tokens = corpus
             self._index = BM25Okapi(corpus, k1=1.5, b=0.75)
@@ -113,17 +115,18 @@ class BM25Retriever:
         -------
         list of article_id values
         """
-        tokens = _tokenize(query)
-        if not tokens:
+        if not query:
             return []
 
         if _USE_BM25S:
             results, scores = self._index.retrieve(
-                bm25s.tokenize(query, lower=True),
-                k=min(k, len(self.article_ids))
+                bm25s.tokenize(query, lower=True, show_progress=False),
+                k=min(k, len(self.article_ids)),
+                show_progress=False
             )
             indices = results[0].tolist()
         else:
+            tokens = _tokenize(query)
             scores = self._index.get_scores(tokens)
             indices = np.argsort(scores)[::-1][:k].tolist()
 
