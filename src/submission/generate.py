@@ -248,7 +248,12 @@ def generate_submission(
     ranked_impressions = []
     has_history = "history" in behaviors.columns
 
-    for row in behaviors.iter_rows(named=True):
+    try:
+        from tqdm import tqdm
+    except ImportError:
+        def tqdm(it, **kw): return it
+
+    for row in tqdm(behaviors.iter_rows(named=True), total=len(behaviors), desc="Generating predictions"):
         imp_id = row["impression_id"]
         impressions = row["impressions"] or []
         labels = row.get("labels")
