@@ -1,11 +1,28 @@
-data/
+# Data — large raw / processed files
+data/raw/
+data/processed/
+data/feature_store/
+data/results/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.env
+
+# Archives & model weights
 *.zip
+*.tar.gz
 *.pt
 *.ckpt
+*.pkl
 *.npy
-*.npz
-*.parquet
-__pycache__/
+
+# IDE
 .DS_Store
-.env
-notebooks/.ipynb_checkpoints/
+.idea/
+*.swp
+
+# Notebooks output
+.ipynb_checkpoints/

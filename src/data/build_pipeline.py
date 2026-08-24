@@ -56,25 +56,31 @@ def parse_mind_behaviors(df: pl.DataFrame) -> pl.DataFrame:
     return df
 
 def parse_mind_news(df: pl.DataFrame) -> pl.DataFrame:
-    """Rename columns to unified schema and fill missing abstracts."""
+    """Rename columns to unified schema and fill missing abstracts.
+    
+    MIND TSV columns: news_id, category, subcategory, title, abstract,
+                      url, title_entities, abstract_entities
+    NOTE: MIND has no published_time — we add a null placeholder so the
+    schema stays unified with EB-NeRD.
+    """
     df = df.rename({
         "news_id": "article_id",
-        "subcategory": "subcategory",
-        "abstract": "subtitle",  # MIND abstract -> subtitle
+        "abstract": "subtitle",   # MIND 'abstract' -> unified 'subtitle'
         "title_entities": "entities",
-        "abstract_entities": "abstract_entities",
     })
     # Add dataset column
     df = df.with_columns(pl.lit("MIND").alias("dataset"))
     # Body is empty for MIND (title + abstract only)
     df = df.with_columns(pl.lit("").alias("body"))
-    # Use category as category, subcategory as subcategory
+    # category_str / subcategory_str mirrors EB-NeRD naming
     df = df.with_columns(
         pl.col("category").alias("category_str"),
         pl.col("subcategory").alias("subcategory_str"),
     )
-    # Popularity: placeholder 0 (will be computed later if needed)
+    # Popularity: placeholder 0 (will be computed from click counts later)
     df = df.with_columns(pl.lit(0).cast(pl.Int64).alias("popularity"))
+    # MIND has no publish date — add null so unified schema is consistent
+    df = df.with_columns(pl.lit(None).cast(pl.Datetime).alias("published_time"))
     # Select unified columns
     df = df.select([
         "dataset", "article_id", "title", "subtitle", "body",
@@ -186,23 +192,30 @@ def build_ebnerd_pipeline(split_ratio=(0.8, 0.1, 0.1)):
     return all_articles, all_behaviors
 
 def build_mind_pipeline(split_ratio=(0.8, 0.1, 0.1)):
-    """Process MIND small, create unified articles and behaviors."""
+    """Process MIND-small, create unified articles and behaviors parquets.
+    
+    Reads from data/raw/mind/news.tsv and data/raw/mind/behaviors.tsv.
+    If train and dev TSVs were merged into the same folder, the later copy
+    (usually dev) wins. We treat the single file as the full available set
+    and apply a temporal split ourselves.
+    """
     # Articles
     news_path = RAW_DIR / "mind" / "news.tsv"
-    news_df = safe_read_mind_tsv(news_path, ["news_id", "category", "subcategory", "title", "abstract", "url", "title_entities", "abstract_entities"])
+    news_df = safe_read_mind_tsv(news_path, [
+        "news_id", "category", "subcategory", "title", "abstract",
+        "url", "title_entities", "abstract_entities"
+    ])
     articles = parse_mind_news(news_df)
+
     # Behaviors
     behav_path = RAW_DIR / "mind" / "behaviors.tsv"
-    behav_df = safe_read_mind_tsv(behav_path, ["impression_id", "user_id", "time", "history", "impressions"])
+    behav_df = safe_read_mind_tsv(behav_path, [
+        "impression_id", "user_id", "time", "history", "impressions"
+    ])
     behaviors = parse_mind_behaviors(behav_df)
     behaviors = behaviors.with_columns(pl.lit("MIND").alias("dataset"))
-    # Temporal split: MIND small train and dev are separate; we only have train.tsv (we copied from MINDsmall_train). Actually we have both train and dev? We copied both? The files in data/raw/mind were from MINDsmall_train and MINDsmall_dev? In Kaggle we only copied MINDsmall_train and MINDsmall_dev? The listing showed MINDsmall_train/ and MINDsmall_dev/ but we copied contents of both into data/raw/mind, so we have behaviors.tsv and news.tsv from train? Wait, we copied both train and dev into same folder, overwriting? Actually we copied both, but they likely have same filenames, so later copy of dev overwrote train. We need to handle this. For now, we will treat the available behaviors.tsv as the train set. To get dev, we should have separate folders. But for simplicity, we will combine all and split temporally ourselves.
-    # Here we just use the single behaviors.tsv (which is the last copied, likely dev). To be safe, we will later fix the copy step. For now, assume it's train.
-    # We will create a temporal split from this single file.
-    behaviors = behaviors.with_columns(
-        pl.col("impression_time").alias("impression_time")
-    )
-    # Sort and split
+
+    # Temporal split
     behaviors = behaviors.sort("impression_time")
     min_time = behaviors["impression_time"].min()
     max_time = behaviors["impression_time"].max()
@@ -214,12 +227,14 @@ def build_mind_pipeline(split_ratio=(0.8, 0.1, 0.1)):
         .when(pl.col("impression_time") <= val_end).then(pl.lit("val"))
         .otherwise(pl.lit("test")).alias("split")
     )
-    # Save articles and behaviors
+
+    # Save
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
     articles.write_parquet(PROCESSED_DIR / "articles_mind.parquet")
     for split in ["train", "val", "test"]:
         subset = behaviors.filter(pl.col("split") == split)
         subset.write_parquet(PROCESSED_DIR / f"behaviors_mind_{split}.parquet")
+    print(f"  MIND: {len(articles)} articles, {len(behaviors)} impressions saved.")
     return articles, behaviors
 
 def main():
