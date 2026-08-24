@@ -84,13 +84,10 @@ def parse_mind_news(df: pl.DataFrame) -> pl.DataFrame:
     return df
 
 def parse_ebnerd_articles(df: pl.DataFrame, dataset_name: str) -> pl.DataFrame:
-    """Convert EB-NeRD articles to unified schema."""
     df = df.with_columns(pl.lit(dataset_name).alias("dataset"))
-    # We want unified columns: dataset, article_id, title, subtitle, body,
-    # category, subcategory, published_time, popularity, entities, abstract_entities
     df = df.with_columns([
         pl.col("category_str").alias("category"),
-        pl.col("subcategory").cast(pl.Utf8).alias("subcategory"),
+        pl.col("subcategory").list.join(",").alias("subcategory"),
         pl.col("total_inviews").alias("popularity"),
         pl.col("entity_groups").alias("entities"),
         pl.col("topics").alias("abstract_entities"),
