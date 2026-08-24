@@ -112,32 +112,23 @@ def parse_ebnerd_behaviors(behaviors_df: pl.DataFrame, history_df: pl.DataFrame)
     # But later we'll need history for query construction. We'll attach history separately.
     # Here we create unified behaviors without history (history will be computed on the fly from history file).
     df = behaviors_df.with_columns(pl.lit("EB-NeRD").alias("dataset"))
+    # Rename inview/clicked columns to unified schema names
     df = df.rename({
         "article_ids_inview": "impressions",
         "article_ids_clicked": "clicked_ids",
     })
-    # Create labels: 1 if article_id in clicked_ids else 0
-    df = df.with_columns(
-        pl.col("impressions").map_elements(
-            lambda inview: [1 if aid in inview else 0 for aid in inview],  # not correct, need clicked ids
-            return_dtype=pl.List(pl.Int64)
-        ).alias("labels_temp")
-    )
-    # Correct label creation: we'll do it later after we have clicked_ids as a set
-    # Better: use article_ids_inview and article_ids_clicked lists
-    # We'll create labels by checking if each id in impressions is in clicked_ids
-    df = df.with_columns(
-        pl.col("article_ids_clicked").alias("clicked_ids")
-    )
-    df = df.drop("article_ids_clicked")
+    # Select only columns we need (drops everything else safely)
     df = df.select([
         "dataset", "impression_id", "user_id", "impression_time",
         "impressions", "clicked_ids"
     ])
-    # Now create labels list
+    # Create labels: 1 if article_id in clicked_ids list, else 0
     df = df.with_columns(
         pl.struct(["impressions", "clicked_ids"]).map_elements(
-            lambda row: [1 if aid in row["clicked_ids"] else 0 for aid in row["impressions"]],
+            lambda row: [
+                1 if (row["clicked_ids"] is not None and aid in row["clicked_ids"]) else 0
+                for aid in (row["impressions"] or [])
+            ],
             return_dtype=pl.List(pl.Int64)
         ).alias("labels")
     )
