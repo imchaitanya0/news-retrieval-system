@@ -43,21 +43,25 @@ def parse_mind_behaviors(df: pl.DataFrame) -> pl.DataFrame:
     )
     df = df.with_columns([
         pl.col("imp_pairs").map_elements(
-            lambda pairs: [p.split("-")[0] for p in pairs if "-" in p],
+            # Keep ALL article IDs — strip the '-label' suffix if present
+            lambda pairs: [p.split("-")[0] for p in pairs if p.strip()],
             return_dtype=pl.List(pl.Utf8)
         ).alias("impressions"),
         pl.col("imp_pairs").map_elements(
-            lambda pairs: [int(p.split("-")[1]) if "-" in p else 0 for p in pairs],
+            # Label = 1/0 if suffix present, -1 if unknown (test/dev set)
+            lambda pairs: [
+                int(p.split("-")[1]) if "-" in p else -1
+                for p in pairs if p.strip()
+            ],
             return_dtype=pl.List(pl.Int64)
         ).alias("labels"),
     ])
     df = df.drop("imp_pairs")
 
-    # Parse history: "N1 N2 N3" → List[Utf8]
-    # Must drop the original string 'history' column FIRST before creating
-    # the parsed list version, otherwise rename() hits a DuplicateError.
     df = df.with_columns(
-        pl.col("history").str.split(" ").alias("history_list"),
+        pl.col("history").fill_null("").str.split(" ").list.eval(
+            pl.element().filter(pl.element().str.len_chars() > 0)
+        ).alias("history_list"),
     )
     df = df.drop("history")
     df = df.rename({"history_list": "history"})

@@ -223,7 +223,6 @@ def generate_submission(
 
     if strategy in ("bm25", "hybrid"):
         from src.retrieval.bm25 import BM25Retriever, _article_text
-        from data.feature_store.bm25 import INDEX_DIR as BM25_IDX  # noqa: avoid circular
         index_path = Path("data/feature_store/bm25") / dataset
         retriever_bm25 = BM25Retriever()
         if (index_path / "bm25_index.pkl").exists():
