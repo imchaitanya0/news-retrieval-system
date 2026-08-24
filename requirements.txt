@@ -1,0 +1,15 @@
+polars
+pyarrow
+duckdb
+rank_bm25
+bm25s
+faiss-cpu
+sentence-transformers
+scikit-learn
+numpy
+pandas
+tqdm
+pytest
+pyyaml
+lightgbm
+catboost
