@@ -2,7 +2,6 @@ import os
 import subprocess
 import shutil
 from pathlib import Path
-from huggingface_hub import hf_hub_download
 
 RAW_DIR = Path("data/raw")
 EBNERD_DIR = RAW_DIR / "ebnerd"
@@ -13,19 +12,19 @@ EBNERD_FILES = {
     "ebnerd_small.zip": "https://ebnerd-dataset.s3.eu-west-1.amazonaws.com/ebnerd_small.zip",
 }
 
-# MIND dataset repository
-MIND_REPO_ID = "yjw1029/MIND"
-MIND_FILES = [
-    "MINDsmall_train.zip",
-    "MINDsmall_dev.zip",
-]
+# Direct Microsoft Azure blob URLs for MIND (public)
+MIND_BASE_URL = "https://mind201910small.blob.core.windows.net/release"
+MIND_FILES = {
+    "MINDsmall_train.zip": f"{MIND_BASE_URL}/MINDsmall_train.zip",
+    "MINDsmall_dev.zip": f"{MIND_BASE_URL}/MINDsmall_dev.zip",
+}
 
 
 def download_file(url, dest_path):
     """Download a file using wget with resume support."""
     dest_path.parent.mkdir(parents=True, exist_ok=True)
-    if dest_path.exists():
-        print(f"File already exists: {dest_path} (skipping)")
+    if dest_path.exists() and dest_path.stat().st_size > 0:
+        print(f"File already exists and non-empty: {dest_path} (skipping)")
         return
     print(f"Downloading {url} -> {dest_path}")
     cmd = ["wget", "-c", "-O", str(dest_path), url]
@@ -39,23 +38,8 @@ def download_ebnerd():
 
 
 def download_mind():
-    for filename in MIND_FILES:
-        local_path = MIND_DIR / filename
-        if local_path.exists():
-            print(f"File already exists: {local_path} (skipping)")
-            continue
-        print(f"Downloading {filename} from Hugging Face dataset {MIND_REPO_ID}...")
-        try:
-            # Download to cache and copy to our data/raw/mind/ folder
-            cached_path = hf_hub_download(
-                repo_id=MIND_REPO_ID,
-                filename=filename,
-                repo_type="dataset",
-            )
-            shutil.copy(cached_path, local_path)
-            print(f"Downloaded {filename} -> {local_path}")
-        except Exception as e:
-            print(f"Failed to download {filename}: {e}")
+    for filename, url in MIND_FILES.items():
+        download_file(url, MIND_DIR / filename)
 
 
 def main():
