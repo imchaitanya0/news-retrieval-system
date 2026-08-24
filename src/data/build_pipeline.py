@@ -28,13 +28,19 @@ def safe_read_mind_tsv(file_path: Path, col_names: list[str]) -> pl.DataFrame:
     return df
 
 def parse_mind_behaviors(df: pl.DataFrame) -> pl.DataFrame:
-    """Convert MIND behaviors strings into structured columns."""
-    # Split impressions string into list of "id-label" pairs
-    df = df.with_columns([
+    """Convert MIND behaviors strings into structured columns.
+
+    Input columns (from TSV): impression_id, user_id, time, history, impressions
+    Output columns: impression_id, user_id, impression_time, history (List[Utf8]),
+                    impressions (List[Utf8]), labels (List[Int64])
+
+    Fix: split 'history' string into a list in-place by dropping the original
+    string column then renaming the parsed list column, avoiding DuplicateError.
+    """
+    # Parse impressions: "N1-1 N2-0 N3-1" → separate id and label lists
+    df = df.with_columns(
         pl.col("impressions").str.split(" ").alias("imp_pairs"),
-        pl.col("history").str.split(" ").alias("hist_list"),
-    ])
-    # Extract article ids and labels from imp_pairs
+    )
     df = df.with_columns([
         pl.col("imp_pairs").map_elements(
             lambda pairs: [p.split("-")[0] for p in pairs if "-" in p],
@@ -45,10 +51,17 @@ def parse_mind_behaviors(df: pl.DataFrame) -> pl.DataFrame:
             return_dtype=pl.List(pl.Int64)
         ).alias("labels"),
     ])
-    # Remove temporary column
     df = df.drop("imp_pairs")
-    # History is already a list of article ids
-    df = df.rename({"hist_list": "history"})
+
+    # Parse history: "N1 N2 N3" → List[Utf8]
+    # Must drop the original string 'history' column FIRST before creating
+    # the parsed list version, otherwise rename() hits a DuplicateError.
+    df = df.with_columns(
+        pl.col("history").str.split(" ").alias("history_list"),
+    )
+    df = df.drop("history")
+    df = df.rename({"history_list": "history"})
+
     # Convert time string to datetime
     df = df.with_columns(
         pl.col("time").str.to_datetime("%m/%d/%Y %I:%M:%S %p", strict=False).alias("impression_time")
