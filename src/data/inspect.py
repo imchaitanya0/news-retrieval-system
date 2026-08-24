@@ -9,7 +9,6 @@ MIND_DIR = RAW_DIR / "mind"
 UNZIP_DIR = RAW_DIR / "unzipped"
 
 def is_valid_file(path: Path) -> bool:
-    """Filter out hidden files and macOS metadata."""
     if "__MACOSX" in path.parts:
         return False
     if path.name.startswith("._"):
@@ -17,7 +16,6 @@ def is_valid_file(path: Path) -> bool:
     return True
 
 def unzip_file(zip_path):
-    """Unzip a zip file into UNZIP_DIR/<stem>."""
     extract_to = UNZIP_DIR / zip_path.stem
     extract_to.mkdir(parents=True, exist_ok=True)
     print(f"Unzipping {zip_path.name} -> {extract_to}")
@@ -34,30 +32,26 @@ def inspect_parquet(file_path):
 
 def inspect_mind_tsv(file_path):
     print(f"\n===== {file_path.relative_to(RAW_DIR)} =====")
+    # Known column names for MIND files
     if file_path.name == "behaviors.tsv":
         col_names = ["impression_id", "user_id", "time", "history", "impressions"]
     elif file_path.name == "news.tsv":
-        col_names = ["news_id", "category", "subcategory", "title", "abstract", "url", "title_entities", "abstract_entities"]
+        col_names = ["news_id", "category", "subcategory", "title", "abstract",
+                     "url", "title_entities", "abstract_entities"]
     else:
-        print(f"Skipping {file_path.name} (not recognized)")
+        print(f"Skipping {file_path.name} (unrecognized)")
         return
-    # Read all columns as strings, no header, infer_schema_length=0 to avoid parse errors
-    df = pl.read_csv(
-        file_path,
-        separator="\t",
-        has_header=False,
-        new_columns=col_names,
-        n_rows=5,
-        infer_schema_length=0,
-        dtypes=[pl.Utf8] * len(col_names),
-        ignore_errors=True,
-    )
-    print("Columns:", df.columns)
-    print(df.head(5))
-    print(f"Total columns: {len(df.columns)}")
+
+    print("Columns:", col_names)
+    # Read first 5 lines as raw text to avoid parsing issues
+    with open(file_path, 'r', encoding='utf-8') as f:
+        lines = [f.readline().strip() for _ in range(5)]
+    for i, line in enumerate(lines):
+        fields = line.split('\t')
+        print(f"Row {i+1} (first 5 fields): {fields[:5]}")
+    print(f"Total columns: {len(col_names)}")
 
 def inspect_directory(dir_path):
-    """Recursively inspect all .parquet, .tsv, .csv, .txt files in dir."""
     for file in sorted(dir_path.rglob("*")):
         if file.is_file() and is_valid_file(file):
             if file.suffix == ".parquet":
@@ -65,10 +59,7 @@ def inspect_directory(dir_path):
                     inspect_parquet(file)
                 except Exception as e:
                     print(f"Error reading {file}: {e}")
-            elif file.suffix in [".tsv", ".csv", ".txt"]:
-                print(f"\n===== {file.relative_to(RAW_DIR)} =====")
-                print("Skipping non-parquet file in EB-NeRD unzipped folder.")
-            # else skip
+            # We ignore other file types in EB-NeRD unzipped folder
 
 def main():
     # Process EB-NeRD zips
@@ -81,17 +72,14 @@ def main():
                 except Exception as e:
                     print(f"Failed to unzip {zip_path}: {e}")
 
-    # Process MIND files (already extracted)
+    # Process MIND files
     if MIND_DIR.exists():
         print(f"\n\n########## MIND files ##########")
         for file in sorted(MIND_DIR.iterdir()):
             if file.is_file() and is_valid_file(file):
                 if file.suffix == ".tsv":
                     inspect_mind_tsv(file)
-                elif file.suffix == ".parquet":
-                    inspect_parquet(file)
-                else:
-                    print(f"Skipping {file.name}")
+                # .vec files skipped
 
 if __name__ == "__main__":
     main()
