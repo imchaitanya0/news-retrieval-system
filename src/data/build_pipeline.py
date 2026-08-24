@@ -86,26 +86,22 @@ def parse_mind_news(df: pl.DataFrame) -> pl.DataFrame:
 def parse_ebnerd_articles(df: pl.DataFrame, dataset_name: str) -> pl.DataFrame:
     """Convert EB-NeRD articles to unified schema."""
     df = df.with_columns(pl.lit(dataset_name).alias("dataset"))
-    # Rename subtitle to subtitle (already), body exists, etc.
-    df = df.rename({
-        "article_id": "article_id",
-        "title": "title",
-        "subtitle": "subtitle",
-        "body": "body",
-        "category_str": "category_str",
-        "subcategory": "subcategory_str",
-        "published_time": "published_time",
-        "total_inviews": "popularity",
-    })
-    # For category and subcategory, we already have category_str and subcategory_str
+    # We want unified columns: dataset, article_id, title, subtitle, body,
+    # category, subcategory, published_time, popularity, entities, abstract_entities
+    df = df.with_columns([
+        pl.col("category_str").alias("category"),
+        pl.col("subcategory").cast(pl.Utf8).alias("subcategory"),
+        pl.col("total_inviews").alias("popularity"),
+        pl.col("entity_groups").alias("entities"),
+        pl.col("topics").alias("abstract_entities"),
+    ])
     df = df.select([
         "dataset", "article_id", "title", "subtitle", "body",
-        "category", "subcategory", "category_str", "subcategory_str",
-        "published_time", "popularity", "entity_groups", "topics"
+        "category", "subcategory", "published_time", "popularity",
+        "entities", "abstract_entities"
     ])
-    # Rename entity_groups -> entities, topics -> abstract_entities for consistency
-    df = df.rename({"entity_groups": "entities", "topics": "abstract_entities"})
     return df
+    
 
 def parse_ebnerd_behaviors(behaviors_df: pl.DataFrame, history_df: pl.DataFrame) -> pl.DataFrame:
     """
