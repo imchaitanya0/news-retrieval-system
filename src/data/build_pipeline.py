@@ -87,7 +87,7 @@ def parse_ebnerd_articles(df: pl.DataFrame, dataset_name: str) -> pl.DataFrame:
     df = df.with_columns(pl.lit(dataset_name).alias("dataset"))
     df = df.with_columns([
         pl.col("category_str").alias("category"),
-        pl.col("subcategory").list.join(",").alias("subcategory"),
+        pl.col("subcategory").cast(pl.List(pl.Utf8)).list.join(",").alias("subcategory"),
         pl.col("total_inviews").alias("popularity"),
         pl.col("entity_groups").alias("entities"),
         pl.col("topics").alias("abstract_entities"),
