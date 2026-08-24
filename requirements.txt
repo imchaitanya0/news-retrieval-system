@@ -13,3 +13,4 @@ pytest
 pyyaml
 lightgbm
 catboost
+huggingface_hub

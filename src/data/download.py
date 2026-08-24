@@ -1,6 +1,8 @@
 import os
 import subprocess
+import shutil
 from pathlib import Path
+from huggingface_hub import hf_hub_download
 
 RAW_DIR = Path("data/raw")
 EBNERD_DIR = RAW_DIR / "ebnerd"
@@ -9,28 +11,14 @@ MIND_DIR = RAW_DIR / "mind"
 EBNERD_FILES = {
     "ebnerd_demo.zip": "https://ebnerd-dataset.s3.eu-west-1.amazonaws.com/ebnerd_demo.zip",
     "ebnerd_small.zip": "https://ebnerd-dataset.s3.eu-west-1.amazonaws.com/ebnerd_small.zip",
-    # Optional: large files if you have enough disk/time later
-    # "ebnerd_large.zip": "https://ebnerd-dataset.s3.eu-west-1.amazonaws.com/ebnerd_large.zip",
-    # "articles_large_only.zip": "https://ebnerd-dataset.s3.eu-west-1.amazonaws.com/artifacts/articles_large_only.zip",
-    # "ebnerd_testset.zip": "https://ebnerd-dataset.s3.eu-west-1.amazonaws.com/ebnerd_testset.zip",
 }
 
-# For MIND, we will download via Hugging Face datasets or direct wget from the repo.
-# The assignment says: https://huggingface.co/datasets/yjw1029/MIND
-# We'll use `hf download` but that requires `huggingface_hub`. We'll include it in requirements.
-# Alternatively, download directly from the GitHub repo? The dataset is large, HF is best.
-# We'll use hf command if available, else wget individual files.
-
-MIND_BASE_URL = "https://huggingface.co/datasets/yjw1029/MIND/resolve/main"
-
-MIND_FILES = {
-    "MINDsmall_train.zip": f"{MIND_BASE_URL}/MINDsmall_train.zip",
-    "MINDsmall_dev.zip": f"{MIND_BASE_URL}/MINDsmall_dev.zip",
-    # Optional:
-    # "MINDlarge_train.zip": f"{MIND_BASE_URL}/MINDlarge_train.zip",
-    # "MINDlarge_dev.zip": f"{MIND_BASE_URL}/MINDlarge_dev.zip",
-    # "MINDlarge_test.zip": f"{MIND_BASE_URL}/MINDlarge_test.zip",
-}
+# MIND dataset repository
+MIND_REPO_ID = "yjw1029/MIND"
+MIND_FILES = [
+    "MINDsmall_train.zip",
+    "MINDsmall_dev.zip",
+]
 
 
 def download_file(url, dest_path):
@@ -51,8 +39,23 @@ def download_ebnerd():
 
 
 def download_mind():
-    for filename, url in MIND_FILES.items():
-        download_file(url, MIND_DIR / filename)
+    for filename in MIND_FILES:
+        local_path = MIND_DIR / filename
+        if local_path.exists():
+            print(f"File already exists: {local_path} (skipping)")
+            continue
+        print(f"Downloading {filename} from Hugging Face dataset {MIND_REPO_ID}...")
+        try:
+            # Download to cache and copy to our data/raw/mind/ folder
+            cached_path = hf_hub_download(
+                repo_id=MIND_REPO_ID,
+                filename=filename,
+                repo_type="dataset",
+            )
+            shutil.copy(cached_path, local_path)
+            print(f"Downloaded {filename} -> {local_path}")
+        except Exception as e:
+            print(f"Failed to download {filename}: {e}")
 
 
 def main():
