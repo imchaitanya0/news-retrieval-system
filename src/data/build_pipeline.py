@@ -251,11 +251,21 @@ def build_mind_pipeline(split_ratio=(0.8, 0.1, 0.1)):
     # Behaviors
     behaviors_frames = []
     for behav_path in mind_dir.rglob("behaviors.tsv"):
-        print(f"Processing MIND behaviors from {behav_path.parent.name}...")
+        folder = behav_path.parent.name.lower()
+        if "test" in folder:
+            split_name = "test"
+        elif "dev" in folder or "val" in folder:
+            split_name = "val"
+        else:
+            split_name = "train"
+        
+        print(f"Processing MIND behaviors from {behav_path.parent.name} (mapped to {split_name})...")
         behav_df = safe_read_mind_tsv(behav_path, [
             "impression_id", "user_id", "time", "history", "impressions"
         ])
-        behaviors_frames.append(parse_mind_behaviors(behav_df))
+        behav_unified = parse_mind_behaviors(behav_df)
+        behav_unified = behav_unified.with_columns(pl.lit(split_name).alias("split_original"))
+        behaviors_frames.append(behav_unified)
     
     if not behaviors_frames:
         print("No MIND behaviors found.")
@@ -263,24 +273,11 @@ def build_mind_pipeline(split_ratio=(0.8, 0.1, 0.1)):
     behaviors = pl.concat(behaviors_frames)
     behaviors = behaviors.with_columns(pl.lit("MIND").alias("dataset"))
 
-    # Temporal split
-    behaviors = behaviors.sort("impression_time")
-    min_time = behaviors["impression_time"].min()
-    max_time = behaviors["impression_time"].max()
-    total_days = (max_time - min_time).days
-    train_end = min_time + timedelta(days=int(total_days * split_ratio[0]))
-    val_end = train_end + timedelta(days=int(total_days * split_ratio[1]))
-    behaviors = behaviors.with_columns(
-        pl.when(pl.col("impression_time") <= train_end).then(pl.lit("train"))
-        .when(pl.col("impression_time") <= val_end).then(pl.lit("val"))
-        .otherwise(pl.lit("test")).alias("split")
-    )
-
     # Save
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
     articles.write_parquet(PROCESSED_DIR / "articles_mind.parquet")
-    for split in ["train", "val", "test"]:
-        subset = behaviors.filter(pl.col("split") == split)
+    for split in behaviors["split_original"].unique():
+        subset = behaviors.filter(pl.col("split_original") == split)
         subset.write_parquet(PROCESSED_DIR / f"behaviors_mind_{split}.parquet")
     print(f"  MIND: {len(articles)} articles, {len(behaviors)} impressions saved.")
     return articles, behaviors

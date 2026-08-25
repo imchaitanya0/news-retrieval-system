@@ -246,6 +246,9 @@ def generate_submission(
             retriever_sem.build(embs, ids)
             retriever_sem.save(index_path)
 
+    from src.retrieval.bm25 import build_query_from_history
+    from src.retrieval.semantic import build_user_vector
+    
     ranked_impressions = []
     has_history = "history" in behaviors.columns
 
@@ -254,30 +257,78 @@ def generate_submission(
     except ImportError:
         def tqdm(it, **kw): return it
 
-    for row in tqdm(behaviors.iter_rows(named=True), total=len(behaviors), desc="Generating predictions"):
-        imp_id = row["impression_id"]
-        impressions = row["impressions"] or []
-        labels = row.get("labels")
+    # Convert to list of dicts for faster iteration than iter_rows()
+    behaviors_dicts = behaviors.to_dicts()
+    batch_size = 10000
 
-        if not impressions:
-            continue
-
-        bm25_order = []
-        sem_order = []
-
+    for i in tqdm(range(0, len(behaviors_dicts), batch_size), desc="Generating predictions (batched)"):
+        batch = behaviors_dicts[i:i+batch_size]
+        
+        bm25_queries = []
+        sem_queries = []
+        
+        for row in batch:
+            hist = row.get("history") or []
+            if isinstance(hist, str):
+                hist = hist.split()
+                
+            if retriever_bm25 and has_history:
+                bm25_queries.append(build_query_from_history(hist, article_text_map, max_history))
+            else:
+                bm25_queries.append("")
+                
+            if retriever_sem and has_history:
+                sem_queries.append(build_user_vector(hist, embedding_map, max_history))
+            else:
+                sem_queries.append(None)
+                
+        # Batch Retrieval BM25
+        batch_bm25_results = [[] for _ in range(len(batch))]
         if retriever_bm25 and has_history:
-            bm25_order = bm25_rank_candidates(row, retriever_bm25, article_text_map, max_history)
+            import bm25s
+            tokens = bm25s.tokenize(bm25_queries, lower=True, show_progress=False)
+            # Retrieve max required k (e.g. 150 for 50 candidates * 3)
+            # We'll just retrieve 200 globally to be safe
+            k_val = min(200, len(retriever_bm25.article_ids))
+            res_idx, _ = retriever_bm25._index.retrieve(tokens, k=k_val, show_progress=False)
+            for r_idx, indices in enumerate(res_idx):
+                if bm25_queries[r_idx]:
+                    batch_bm25_results[r_idx] = [retriever_bm25.article_ids[idx] for idx in indices]
+                    
+        # Batch Retrieval FAISS
+        batch_sem_results = [[] for _ in range(len(batch))]
         if retriever_sem and has_history:
-            sem_order = semantic_rank_candidates(row, retriever_sem, embedding_map, max_history)
+            valid_vecs = []
+            valid_idx_map = []
+            for r_idx, vec in enumerate(sem_queries):
+                if vec is not None:
+                    valid_vecs.append(vec)
+                    valid_idx_map.append(r_idx)
+            if valid_vecs:
+                vec_array = np.vstack(valid_vecs)
+                k_val = min(200, len(retriever_sem.article_ids))
+                _, I = retriever_sem._index.search(vec_array, k_val)
+                for map_idx, indices in enumerate(I):
+                    r_idx = valid_idx_map[map_idx]
+                    batch_sem_results[r_idx] = [retriever_sem.article_ids[idx] for idx in indices]
 
-        ranked = rank_impressions(
-            impressions=impressions,
-            bm25_order=bm25_order,
-            semantic_order=sem_order,
-            strategy=strategy,
-            labels=labels,
-        )
-        ranked_impressions.append((imp_id, impressions, ranked))
+        # Fusion & Rank for the batch
+        for r_idx, row in enumerate(batch):
+            imp_id = row["impression_id"]
+            impressions = row.get("impressions") or []
+            if isinstance(impressions, str):
+                impressions = impressions.split()
+            if not impressions:
+                continue
+                
+            ranked = rank_impressions(
+                impressions=impressions,
+                bm25_order=batch_bm25_results[r_idx],
+                semantic_order=batch_sem_results[r_idx],
+                strategy=strategy,
+                labels=row.get("labels")
+            )
+            ranked_impressions.append((imp_id, impressions, ranked))
 
     SUBMISSION_DIR.mkdir(parents=True, exist_ok=True)
     out_path = SUBMISSION_DIR / f"{dataset}_{split}_{strategy}.txt"
