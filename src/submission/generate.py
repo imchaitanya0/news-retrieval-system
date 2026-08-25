@@ -215,7 +215,9 @@ def generate_submission(
 
     print(f"\n[Submit] Generating {dataset} / {split} with strategy={strategy}")
     articles = pl.read_parquet(articles_path)
-    n_behaviors = pl.read_parquet(behaviors_path, columns=["impression_id"]).height
+    # Read behaviors ONCE into columnar RAM (~500MB polars format, not Python dicts)
+    behaviors = pl.read_parquet(behaviors_path)
+    n_behaviors = len(behaviors)
     print(f"  Total impressions to process: {n_behaviors:,}")
 
     retriever_bm25 = None
@@ -257,17 +259,12 @@ def generate_submission(
     SUBMISSION_DIR.mkdir(parents=True, exist_ok=True)
     out_path = SUBMISSION_DIR / f"{dataset}_{split}_{strategy}.txt"
 
-    # Stream parquet in chunks — never loads all 2.3M rows into RAM at once
-    chunk_size = 2000
+    # Stream in 5000-row slices — polars .slice() is zero-copy, no RAM overhead
+    chunk_size = 5000
     n_written = 0
     with open(out_path, "w") as out_f:
         for chunk_start in tqdm(range(0, n_behaviors, chunk_size), desc="Generating predictions"):
-            chunk = pl.read_parquet(
-                behaviors_path,
-                row_index_offset=chunk_start,
-            ).slice(0, chunk_size)
-
-            batch = chunk.to_dicts()
+            batch = behaviors.slice(chunk_start, chunk_size).to_dicts()
             bm25_queries, sem_queries = [], []
 
             for row in batch:
