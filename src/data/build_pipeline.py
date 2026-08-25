@@ -159,29 +159,38 @@ def parse_ebnerd_behaviors(behaviors_df: pl.DataFrame, history_df: pl.DataFrame)
     return df
 
 def build_ebnerd_pipeline(split_ratio=(0.8, 0.1, 0.1)):
-    """Process EB-NeRD demo and small, create unified articles and behaviors."""
+    """Process EB-NeRD data recursively, creating unified articles and behaviors."""
     articles_frames = []
     behaviors_frames = []
-    for dataset_dir in [UNZIP_DIR / "ebnerd_demo", UNZIP_DIR / "ebnerd_small"]:
-        if not dataset_dir.exists():
-            continue
-        print(f"Processing {dataset_dir.name}...")
-        articles_path = dataset_dir / "articles.parquet"
+    
+    ebnerd_dir = RAW_DIR / "ebnerd"
+    if not ebnerd_dir.exists():
+        print("No EB-NeRD directory found.")
+        return
+
+    # Find all articles.parquet
+    for articles_path in ebnerd_dir.rglob("articles.parquet"):
+        print(f"Processing EB-NeRD articles from {articles_path.parent.name}...")
         articles = pl.read_parquet(articles_path)
-        articles = parse_ebnerd_articles(articles, dataset_dir.name)
+        articles = parse_ebnerd_articles(articles, articles_path.parent.name)
         articles_frames.append(articles)
 
-        # Process train and validation behaviors
-        for split_name in ["train", "validation"]:
-            behaviors_path = dataset_dir / split_name / "behaviors.parquet"
-            history_path = dataset_dir / split_name / "history.parquet"
-            if not behaviors_path.exists():
-                continue
-            behaviors = pl.read_parquet(behaviors_path)
-            history = pl.read_parquet(history_path)
-            behav_unified = parse_ebnerd_behaviors(behaviors, history)
-            behav_unified = behav_unified.with_columns(pl.lit(split_name).alias("split_original"))
-            behaviors_frames.append(behav_unified)
+    # Find all behaviors.parquet
+    for behaviors_path in ebnerd_dir.rglob("behaviors.parquet"):
+        history_path = behaviors_path.parent / "history.parquet"
+        if not history_path.exists():
+            continue
+        print(f"Processing EB-NeRD behaviors from {behaviors_path.parent.name}...")
+        behaviors = pl.read_parquet(behaviors_path)
+        history = pl.read_parquet(history_path)
+        behav_unified = parse_ebnerd_behaviors(behaviors, history)
+        behav_unified = behav_unified.with_columns(pl.lit(behaviors_path.parent.name).alias("split_original"))
+        behaviors_frames.append(behav_unified)
+
+    if not articles_frames or not behaviors_frames:
+        print("No EB-NeRD articles or behaviors found to concatenate.")
+        return
+
     # Combine all articles
     all_articles = pl.concat(articles_frames).unique(subset=["article_id"])
     # Combine all behaviors
@@ -216,20 +225,39 @@ def build_mind_pipeline(split_ratio=(0.8, 0.1, 0.1)):
     (usually dev) wins. We treat the single file as the full available set
     and apply a temporal split ourselves.
     """
+    mind_dir = RAW_DIR / "mind"
+    if not mind_dir.exists():
+        print("No MIND directory found.")
+        return
+
     # Articles
-    news_path = RAW_DIR / "mind" / "news.tsv"
-    news_df = safe_read_mind_tsv(news_path, [
-        "news_id", "category", "subcategory", "title", "abstract",
-        "url", "title_entities", "abstract_entities"
-    ])
-    articles = parse_mind_news(news_df)
+    articles_frames = []
+    for news_path in mind_dir.rglob("news.tsv"):
+        print(f"Processing MIND articles from {news_path.parent.name}...")
+        news_df = safe_read_mind_tsv(news_path, [
+            "news_id", "category", "subcategory", "title", "abstract",
+            "url", "title_entities", "abstract_entities"
+        ])
+        articles_frames.append(parse_mind_news(news_df))
+    
+    if not articles_frames:
+        print("No MIND articles found.")
+        return
+    articles = pl.concat(articles_frames).unique(subset=["article_id"])
 
     # Behaviors
-    behav_path = RAW_DIR / "mind" / "behaviors.tsv"
-    behav_df = safe_read_mind_tsv(behav_path, [
-        "impression_id", "user_id", "time", "history", "impressions"
-    ])
-    behaviors = parse_mind_behaviors(behav_df)
+    behaviors_frames = []
+    for behav_path in mind_dir.rglob("behaviors.tsv"):
+        print(f"Processing MIND behaviors from {behav_path.parent.name}...")
+        behav_df = safe_read_mind_tsv(behav_path, [
+            "impression_id", "user_id", "time", "history", "impressions"
+        ])
+        behaviors_frames.append(parse_mind_behaviors(behav_df))
+    
+    if not behaviors_frames:
+        print("No MIND behaviors found.")
+        return
+    behaviors = pl.concat(behaviors_frames)
     behaviors = behaviors.with_columns(pl.lit("MIND").alias("dataset"))
 
     # Temporal split
