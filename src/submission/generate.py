@@ -214,8 +214,9 @@ def generate_submission(
         raise FileNotFoundError(f"Run build_pipeline.py first: {articles_path}")
 
     print(f"\n[Submit] Generating {dataset} / {split} with strategy={strategy}")
-    behaviors = pl.read_parquet(behaviors_path)
     articles = pl.read_parquet(articles_path)
+    n_behaviors = pl.read_parquet(behaviors_path, columns=["impression_id"]).height
+    print(f"  Total impressions to process: {n_behaviors:,}")
 
     retriever_bm25 = None
     retriever_sem = None
@@ -248,94 +249,80 @@ def generate_submission(
 
     from src.retrieval.bm25 import build_query_from_history
     from src.retrieval.semantic import build_user_vector
-    
-    ranked_impressions = []
-    has_history = "history" in behaviors.columns
-
     try:
         from tqdm import tqdm
     except ImportError:
         def tqdm(it, **kw): return it
 
-    # Convert to list of dicts for faster iteration than iter_rows()
-    behaviors_dicts = behaviors.to_dicts()
-    batch_size = 10000
-
-    for i in tqdm(range(0, len(behaviors_dicts), batch_size), desc="Generating predictions (batched)"):
-        batch = behaviors_dicts[i:i+batch_size]
-        
-        bm25_queries = []
-        sem_queries = []
-        
-        for row in batch:
-            hist = row.get("history") or []
-            if isinstance(hist, str):
-                hist = hist.split()
-                
-            if retriever_bm25 and has_history:
-                bm25_queries.append(build_query_from_history(hist, article_text_map, max_history))
-            else:
-                bm25_queries.append("")
-                
-            if retriever_sem and has_history:
-                sem_queries.append(build_user_vector(hist, embedding_map, max_history))
-            else:
-                sem_queries.append(None)
-                
-        # Batch Retrieval BM25
-        batch_bm25_results = [[] for _ in range(len(batch))]
-        if retriever_bm25 and has_history:
-            import bm25s
-            tokens = bm25s.tokenize(bm25_queries, lower=True, show_progress=False)
-            # Retrieve max required k (e.g. 150 for 50 candidates * 3)
-            # We'll just retrieve 200 globally to be safe
-            k_val = min(200, len(retriever_bm25.article_ids))
-            res_idx, _ = retriever_bm25._index.retrieve(tokens, k=k_val, show_progress=False)
-            for r_idx, indices in enumerate(res_idx):
-                if bm25_queries[r_idx]:
-                    batch_bm25_results[r_idx] = [retriever_bm25.article_ids[idx] for idx in indices]
-                    
-        # Batch Retrieval FAISS
-        batch_sem_results = [[] for _ in range(len(batch))]
-        if retriever_sem and has_history:
-            valid_vecs = []
-            valid_idx_map = []
-            for r_idx, vec in enumerate(sem_queries):
-                if vec is not None:
-                    valid_vecs.append(vec)
-                    valid_idx_map.append(r_idx)
-            if valid_vecs:
-                vec_array = np.vstack(valid_vecs)
-                k_val = min(200, len(retriever_sem.article_ids))
-                _, I = retriever_sem._index.search(vec_array, k_val)
-                for map_idx, indices in enumerate(I):
-                    r_idx = valid_idx_map[map_idx]
-                    batch_sem_results[r_idx] = [retriever_sem.article_ids[idx] for idx in indices]
-
-        # Fusion & Rank for the batch
-        for r_idx, row in enumerate(batch):
-            imp_id = row["impression_id"]
-            impressions = row.get("impressions") or []
-            if isinstance(impressions, str):
-                impressions = impressions.split()
-            if not impressions:
-                continue
-                
-            ranked = rank_impressions(
-                impressions=impressions,
-                bm25_order=batch_bm25_results[r_idx],
-                semantic_order=batch_sem_results[r_idx],
-                strategy=strategy,
-                labels=row.get("labels")
-            )
-            ranked_impressions.append((imp_id, impressions, ranked))
-
     SUBMISSION_DIR.mkdir(parents=True, exist_ok=True)
     out_path = SUBMISSION_DIR / f"{dataset}_{split}_{strategy}.txt"
-    if dataset == "mind":
-        write_mind_submission(ranked_impressions, out_path)
-    else:
-        write_ebnerd_submission(ranked_impressions, out_path)
+
+    # Stream parquet in chunks — never loads all 2.3M rows into RAM at once
+    chunk_size = 2000
+    n_written = 0
+    with open(out_path, "w") as out_f:
+        for chunk_start in tqdm(range(0, n_behaviors, chunk_size), desc="Generating predictions"):
+            chunk = pl.read_parquet(
+                behaviors_path,
+                row_index_offset=chunk_start,
+            ).slice(0, chunk_size)
+
+            batch = chunk.to_dicts()
+            bm25_queries, sem_queries = [], []
+
+            for row in batch:
+                hist = row.get("history") or []
+                bm25_queries.append(build_query_from_history(hist, article_text_map, max_history) if retriever_bm25 else "")
+                sem_queries.append(build_user_vector(hist, embedding_map, max_history) if retriever_sem else None)
+
+            # Batch BM25
+            batch_bm25 = [[] for _ in batch]
+            if retriever_bm25:
+                import bm25s
+                k_val = min(200, len(retriever_bm25.article_ids))
+                tokens = bm25s.tokenize(bm25_queries, lower=True, show_progress=False)
+                res_idx, _ = retriever_bm25._index.retrieve(tokens, k=k_val, show_progress=False)
+                for r, indices in enumerate(res_idx):
+                    if bm25_queries[r]:
+                        batch_bm25[r] = [retriever_bm25.article_ids[idx] for idx in indices]
+
+            # Batch FAISS
+            batch_sem = [[] for _ in batch]
+            if retriever_sem:
+                valid_vecs, valid_map = [], []
+                for r, vec in enumerate(sem_queries):
+                    if vec is not None:
+                        valid_vecs.append(vec)
+                        valid_map.append(r)
+                if valid_vecs:
+                    k_val = min(200, len(retriever_sem.article_ids))
+                    _, I = retriever_sem._index.search(np.vstack(valid_vecs), k_val)
+                    for mi, indices in enumerate(I):
+                        batch_sem[valid_map[mi]] = [retriever_sem.article_ids[idx] for idx in indices]
+
+            # Fusion & write directly to file (no accumulation in RAM)
+            for r, row in enumerate(batch):
+                imp_id = row["impression_id"]
+                impressions = row.get("impressions") or []
+                if isinstance(impressions, str):
+                    impressions = impressions.split()
+                if not impressions:
+                    continue
+                ranked = rank_impressions(
+                    impressions=impressions,
+                    bm25_order=batch_bm25[r],
+                    semantic_order=batch_sem[r],
+                    strategy=strategy,
+                    labels=row.get("labels"),
+                )
+                rank_map = {aid: rank for rank, aid in enumerate(ranked, 1)}
+                ranks = [str(rank_map.get(aid, len(ranked)+1)) for aid in impressions]
+                out_f.write(f"{imp_id} [{','.join(ranks)}]\n")
+                n_written += 1
+
+    print(f"Submission saved → {out_path} ({n_written:,} impressions)")
+    return
+
 
 
 # ------------------------------------------------------------------ #
