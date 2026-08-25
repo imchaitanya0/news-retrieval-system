@@ -163,14 +163,15 @@ def semantic_rank_candidates(
 def write_mind_submission(ranked_impressions: list, out_path: Path) -> None:
     """
     Write MIND Codabench format.
-
-    Format: {impression_id} [{N1}-1 {N2}-2 ...]
+    Format: {impression_id} [{rank1},{rank2},...] (NO SPACES inside brackets)
+    Ranks must correspond exactly to the order of candidates in the original impression log.
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as f:
-        for imp_id, ranked_ids in ranked_impressions:
-            parts = [f"{aid}-{rank}" for rank, aid in enumerate(ranked_ids, 1)]
-            f.write(f"{imp_id} [{' '.join(parts)}]\n")
+        for imp_id, original_impressions, ranked_ids in ranked_impressions:
+            rank_map = {aid: rank for rank, aid in enumerate(ranked_ids, 1)}
+            ranks = [str(rank_map.get(aid, len(ranked_ids)+1)) for aid in original_impressions]
+            f.write(f"{imp_id} [{','.join(ranks)}]\n")
     print(f"MIND submission saved → {out_path} ({len(ranked_impressions)} impressions)")
 
 
@@ -276,7 +277,7 @@ def generate_submission(
             strategy=strategy,
             labels=labels,
         )
-        ranked_impressions.append((imp_id, ranked))
+        ranked_impressions.append((imp_id, impressions, ranked))
 
     SUBMISSION_DIR.mkdir(parents=True, exist_ok=True)
     out_path = SUBMISSION_DIR / f"{dataset}_{split}_{strategy}.txt"

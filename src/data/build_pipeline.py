@@ -136,22 +136,25 @@ def parse_ebnerd_behaviors(behaviors_df: pl.DataFrame, history_df: pl.DataFrame)
     # Here we create unified behaviors without history (history will be computed on the fly from history file).
     df = behaviors_df.with_columns(pl.lit("EB-NeRD").alias("dataset"))
     # Rename inview/clicked columns to unified schema names
-    df = df.rename({
-        "article_ids_inview": "impressions",
-        "article_ids_clicked": "clicked_ids",
-    })
+    # Note: test set does not have article_ids_clicked!
+    df = df.rename({"article_ids_inview": "impressions"})
+    if "article_ids_clicked" in df.columns:
+        df = df.rename({"article_ids_clicked": "clicked_ids"})
+    else:
+        df = df.with_columns(pl.lit(None).alias("clicked_ids"))
+
     # Select only columns we need (drops everything else safely)
     df = df.select([
         "dataset", "impression_id", "user_id", "impression_time",
         "impressions", "clicked_ids"
     ])
-    # Create labels: 1 if article_id in clicked_ids list, else 0
+    # Create labels:    # Labels: 1 if in clicked_ids, else 0 (or -1 if clicked_ids is null for test set)
     df = df.with_columns(
         pl.struct(["impressions", "clicked_ids"]).map_elements(
-            lambda row: [
-                1 if (row["clicked_ids"] is not None and aid in row["clicked_ids"]) else 0
-                for aid in (row["impressions"] or [])
-            ],
+            lambda x: (
+                [-1] * len(x["impressions"]) if x["clicked_ids"] is None
+                else [1 if aid in x["clicked_ids"] else 0 for aid in x["impressions"]]
+            ),
             return_dtype=pl.List(pl.Int64)
         ).alias("labels")
     )
