@@ -120,7 +120,8 @@ def generate_submission(
     txt_path  = SUBMISSION_DIR / txt_name
 
     DIM        = emb_np.shape[1]
-    chunk_size = 2000   # safe for T4: 2000 × 120K × 4B = 960MB well within 14GB
+    chunk_size = 10000
+
     n_written  = 0
 
     with open(out_path, "w") as out_f:
