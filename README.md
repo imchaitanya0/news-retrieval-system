@@ -1,256 +1,169 @@
-# News Retrieval System — CS4.406 Assignment 1
+# News Retrieval System — IRE Assignment 1
 
-A reproducible news recommendation retrieval pipeline supporting both **MIND-small** and **EB-NeRD demo/small** datasets.
+A hybrid neural news recommendation system built for the **MIND** and **EB-NeRD RecSys 2024** competitions.
 
 ---
 
-## Quick Start (one command)
+## What We Built and Why
+
+### Architecture Overview
+
+```
+Raw Data (MIND TSV / EB-NeRD Parquet)
+        ↓
+src/data/build_pipeline.py     ← Unified schema, temporal split
+        ↓
+data/processed/                ← articles_*.parquet, behaviors_*.parquet
+        ↓
+src/retrieval/
+  bm25.py       ← Lexical retrieval (BM25 keyword matching)
+  semantic.py   ← Neural retrieval (sentence-transformer embeddings + FAISS)
+        ↓
+src/submission/generate.py     ← GPU-accelerated hybrid scorer → Codabench ZIP
+        ↓
+data/submissions/*.zip         ← prediction.txt / predictions.txt
+```
+
+---
+
+## Key Design Decisions
+
+### 1. Why Two Retrievers (BM25 + Semantic)?
+
+News recommendation has two very different kinds of queries:
+
+| Signal | BM25 | Semantic |
+|--------|------|----------|
+| Keyword match (e.g. "Manchester United") | ✅ Exact | ❌ Misses if paraphrase |
+| Topic similarity (sports → sports news) | ❌ Misses | ✅ Understands meaning |
+| Cold-start users (no history) | ❌ No query | ❌ No vector |
+| Speed | Very fast | Fast (GPU) |
+
+Neither alone is sufficient. We combine them.
+
+### 2. Why Direct Candidate Scoring (not Global Retrieval)?
+
+The test impressions already contain **20–100 pre-selected candidate articles** from the platform. Our job is only to **rerank** these candidates.
+
+Early versions retrieved top-200 from 120,000 articles globally, then filtered. The overlap with the 20 pre-selected candidates was nearly zero, so 90%+ of impressions fell back to random order → AUC ≈ 0.51.
+
+**Fix:** We directly score each candidate in the impression:
+- **Semantic:** `dot(user_embedding, candidate_embedding)` — GPU batch matmul across all impressions
+- **BM25:** Global BM25 retrieval of top-500, check if each candidate is in that set
+- **Popularity:** Frequency of article appearing as a candidate globally (cold-start signal)
+
+### 3. Why GPU Batch Matrix Multiply?
+
+For 2.3M MIND impressions × 20 candidates × 384-dim embeddings:
+
+| Method | Time |
+|--------|------|
+| Python for loop, one-by-one | ~9 hours |
+| Numpy CPU batch (10K × 120K) | ~30 minutes |
+| GPU CUDA batch (10K × 120K) | ~10 minutes |
+
+We pre-load all 120K article embeddings into a single CUDA tensor, then compute `torch.mm(user_vectors, embedding_matrix.T)` — one matrix multiply for 10,000 users at once.
+
+### 4. Why `paraphrase-multilingual-MiniLM-L12-v2`?
+
+- **Multilingual:** Works for both English (MIND) and Danish (EB-NeRD) without separate models
+- **Small (384-dim):** Fast encoding, small FAISS index, fits in Kaggle RAM
+- **Pre-trained:** Strong semantic understanding without any fine-tuning on our data
+
+### 5. Why Not Fine-Tune the Embeddings?
+
+Fine-tuning (e.g., NRMS, NAML) requires the training dataset (~50GB) and GPU training time. For the zero-shot baseline, pre-trained multilingual embeddings give competitive performance quickly. The LightGBM reranker (next phase) provides additional improvement using handcrafted features.
+
+### 6. Score Fusion Weights
+
+`score = 0.7 × semantic + 0.2 × bm25_overlap + 0.1 × popularity`
+
+- **0.7 semantic:** Neural embeddings capture topic similarity reliably
+- **0.2 BM25:** Keyword match prevents semantic drift for specific queries
+- **0.1 popularity:** Tiebreaker for cold-start users with no history
+
+### 7. Why Polars (not Pandas)?
+
+Polars processes data in parallel using Rust under the hood. Reading 2.3M behavior rows takes ~2 seconds in Polars vs ~30 seconds in Pandas. This was critical given Kaggle's time and RAM constraints.
+
+---
+
+## Current Status
+
+| Task | Status |
+|------|--------|
+| MIND data processing | ✅ Done |
+| EB-NeRD data processing | ✅ Done |
+| BM25 retrieval | ✅ Done |
+| Semantic embeddings (FAISS) | ✅ Done |
+| Hybrid scoring | ✅ Done |
+| MIND baseline submission | ✅ Submitted (AUC: 0.5131 — random baseline) |
+| EB-NeRD baseline submission | ✅ Submitted |
+| Direct candidate scoring fix | ✅ Done (expected AUC: 0.60+) |
+| GPU-accelerated generation | ✅ Done |
+| LightGBM reranker | 🔵 In progress |
+| Evaluation metrics (AUC/MRR/nDCG) | ⬜ Pending |
+| Design note | ⬜ Pending |
+
+---
+
+## What Went Wrong and How We Fixed It
+
+### Problem 1: `ValueError: cannot concat empty list`
+**Cause:** `build_pipeline.py` had hardcoded folder names (`ebnerd_demo`, `ebnerd_small`) that didn't match the downloaded `ebnerd_testset` structure.
+**Fix:** Replaced hardcoded paths with `rglob("behaviors.parquet")` to dynamically discover all data regardless of folder names.
+
+### Problem 2: AUC = 0.51 (barely above random)
+**Cause:** Global BM25/FAISS retrieval from 120K articles had near-zero overlap with the 20 pre-selected test candidates. Fell back to original (random) order.
+**Fix:** Switched to **direct candidate scoring** — score each candidate in the impression directly using dot products, not global retrieval.
+
+### Problem 3: 9–34 hour runtime estimates
+**Cause 1:** Per-impression BM25 mini-index rebuild (2.3M × BM25 index construction = hours of CPU).
+**Cause 2:** Re-reading the parquet file 1186 times inside the chunk loop.
+**Fix:** Load parquet once → load embeddings into GPU tensor once → use `torch.mm()` for batch matrix multiply → BM25 as global overlap check (not per-impression index).
+
+### Problem 4: EB-NeRD OOM crash
+**Cause:** `behaviors.to_dicts()` on 6M rows = ~6GB of Python dicts.
+**Fix:** Stream 10K rows at a time using `behaviors.slice(offset, chunk_size).to_dicts()`.
+
+### Problem 5: Codabench validation failure
+**Cause:** Wrong file name (`predictions.txt` vs `prediction.txt`) and wrong format (space-separated vs comma-separated ranks).
+**Fix:** MIND → `prediction.txt`, EB-NeRD → `predictions.txt`. Format: `{imp_id} [{r1},{r2},...}]` with no spaces inside brackets.
+
+---
+
+## One-Command Reproduction (Kaggle)
 
 ```bash
-# 1. Install dependencies
-pip install -r requirements.txt
+# 1. Install
+!pip install -q bm25s rank_bm25 faiss-gpu sentence-transformers polars
 
-# 2. Build the processed data (run from repo root)
-python -m src.data.build_pipeline
+# 2. Download raw data
+!mkdir -p data/raw/mind
+!wget -q https://mind201910small.blob.core.windows.net/release/MINDlarge_test.zip
+!unzip -q MINDlarge_test.zip -d data/raw/mind/ && rm MINDlarge_test.zip
+!huggingface-cli download Ekstra-Bladet/ebnerd_testset --repo-type dataset --local-dir data/raw/ebnerd/
 
-# 3. Evaluate BM25 retrieval on MIND validation split
-python -m src.retrieval.bm25 --dataset mind --split val
-
-# 4. Evaluate semantic retrieval on MIND validation split
-python -m src.retrieval.semantic --dataset mind --split val
-
-# 5. Run all integrity tests
-pytest tests/ -v
-```
-
----
-
-## Project Structure
-
-```
-news-retrieval-system/
-├── data/
-│   ├── raw/
-│   │   ├── mind/               ← Place behaviors.tsv + news.tsv here
-│   │   └── ebnerd/             ← Place ebnerd_demo.zip, ebnerd_small.zip here
-│   ├── processed/              ← Auto-generated by build_pipeline.py
-│   │   ├── articles_mind.parquet
-│   │   ├── articles_ebnerd.parquet
-│   │   ├── behaviors_mind_{train,val,test}.parquet
-│   │   └── behaviors_ebnerd_{train,val,test}.parquet
-│   ├── feature_store/          ← Auto-generated indexes & embeddings
-│   │   ├── bm25/{mind,ebnerd}/bm25_index.pkl
-│   │   ├── embeddings/{mind,ebnerd}/article_embeddings.npy
-│   │   └── semantic/{mind,ebnerd}/faiss.index
-│   └── results/                ← JSON output from evaluations
-├── src/
-│   ├── data/
-│   │   ├── build_pipeline.py   ← Q1: Full data pipeline
-│   │   ├── download.py         ← Download helper
-│   │   └── inspect.py          ← Data schema inspector
-│   ├── retrieval/
-│   │   ├── bm25.py             ← Q2: BM25 lexical retrieval
-│   │   └── semantic.py         ← Q3: Embedding-based retrieval
-│   ├── evaluation/             ← Q4: Metrics harness (TODO)
-│   ├── submission/             ← Q5: Codabench prediction files (TODO)
-│   └── models/                 ← Q3 Day 3: LightGBM ranker (TODO)
-├── tests/
-│   └── test_anti_gaming.py     ← Anti-gaming + schema integrity tests
-├── requirements.txt
-├── plan.md
-└── README.md
-```
-
----
-
-## Data Setup
-
-### MIND-small (on Kaggle)
-```python
-# In Kaggle notebook:
-import zipfile, shutil, os
-
-# Extract MINDsmall_train and MINDsmall_dev into data/raw/mind/
-for split in ['MINDsmall_train', 'MINDsmall_dev']:
-    with zipfile.ZipFile(f'/kaggle/input/mind-news/{split}.zip') as z:
-        z.extractall(f'/kaggle/working/news-retrieval-system/data/raw/mind/{split}/')
-
-# NOTE: keep train and dev in separate subfolders so build_pipeline
-#       can read both without overwriting.
-```
-
-### EB-NeRD (on Kaggle)
-```bash
-# Place zip files in data/raw/ebnerd/
-# The pipeline auto-unzips into data/raw/unzipped/
-wget https://ebnerd-dataset.s3.eu-west-1.amazonaws.com/ebnerd_demo.zip
-wget https://ebnerd-dataset.s3.eu-west-1.amazonaws.com/ebnerd_small.zip
-```
-
----
-
-## Unified Schema
-
-### Articles (`articles_{dataset}.parquet`)
-
-| Column | Type | Notes |
-|--------|------|-------|
-| `dataset` | Utf8 | "MIND" or "ebnerd_demo" etc. |
-| `article_id` | Utf8/Int | Primary key |
-| `title` | Utf8 | |
-| `subtitle` | Utf8 | Abstract (MIND) or subtitle (EB-NeRD) |
-| `body` | Utf8 | Full body (EB-NeRD); empty string for MIND |
-| `category` | Utf8 | |
-| `subcategory` | Utf8 | Comma-joined for EB-NeRD (was a list) |
-| `published_time` | Datetime | null for MIND (not provided) |
-| `popularity` | Int64 | total_inviews (EB-NeRD); 0 placeholder (MIND) |
-| `entities` | Utf8/List | Named entities |
-| `abstract_entities` | Utf8/List | |
-
-### Behaviors (`behaviors_{dataset}_{split}.parquet`)
-
-| Column | Type | Notes |
-|--------|------|-------|
-| `dataset` | Utf8 | |
-| `impression_id` | Utf8/Int | |
-| `user_id` | Utf8/Int | |
-| `impression_time` | Datetime | Used for temporal splitting |
-| `impressions` | List[Int/Utf8] | Candidate article IDs shown to user |
-| `labels` | List[Int64] | 1 = clicked, 0 = not clicked |
-| `history` | List[Utf8] | *MIND only* — prior click history |
-| `split` | Utf8 | "train" / "val" / "test" |
-
----
-
-## Q1: Data Pipeline (`src/data/build_pipeline.py`)
-
-**Status: ✅ Complete**
-
-- Reads MIND TSV files with a robust CSV reader (handles embedded newlines/quotes)
-- Reads EB-NeRD Parquet files (auto-unzipped)
-- Produces a **unified schema** for both datasets (articles + behaviors)
-- Applies **temporal splitting** (80/10/10 by time, never random) to prevent future leakage
-- Saves processed Parquet files to `data/processed/`
-
-```bash
-python -m src.data.build_pipeline
-```
-
-### Known Differences Between Datasets
-
-| Feature | MIND | EB-NeRD |
-|---------|------|---------|
-| `published_time` | ❌ (null placeholder) | ✅ |
-| `body` | ❌ (empty string) | ✅ |
-| `history` column in behaviors | ✅ | ❌ (history in separate file) |
-| `subcategory` type | string | list→joined string |
-
----
-
-## Q2: BM25 Lexical Retrieval (`src/retrieval/bm25.py`)
-
-**Status: ✅ Complete**
-
-### How it works
-
-1. **Index build**: Tokenises `title + subtitle` for every article and builds a BM25 index (using `bm25s` if available, else `rank_bm25`). Index is cached to `data/feature_store/bm25/` as a pickle.
-2. **Query construction**: Takes the **last 10** clicked article IDs from the user's history and concatenates their `title + subtitle` into a query string. Using only recent history (not all history) reduces noise — in news, older clicks are less predictive.
-3. **Retrieval**: BM25 scores all indexed articles against the query and returns the top-K.
-4. **Evaluation**: Reports Recall@K for K ∈ {50, 100, 200}.
-
-```bash
-# Evaluate on MIND val split
-python -m src.retrieval.bm25 --dataset mind --split val --k 50 100 200
-
-# Force rebuild the index
-python -m src.retrieval.bm25 --dataset mind --split val --rebuild-index
-
-# Tune history window
-python -m src.retrieval.bm25 --dataset mind --split val --max-history 5
-```
-
-Results saved to `data/results/bm25_{dataset}_{split}.json`.
-
----
-
-## Q3: Semantic Retrieval (`src/retrieval/semantic.py`)
-
-**Status: ✅ Complete**
-
-### How it works
-
-1. **Embeddings**: Computes article embeddings using `sentence-transformers` (`paraphrase-multilingual-MiniLM-L12-v2`). Embeddings are L2-normalised and cached to `data/feature_store/embeddings/` as `.npy` files.
-2. **FAISS index**: Builds a `IndexFlatIP` (exact inner-product, equivalent to cosine for normalised vectors). Cached to `data/feature_store/semantic/`.
-3. **User vector**: Mean-pools the embeddings of the last 10 clicked articles.
-4. **Retrieval**: FAISS returns the top-K nearest articles.
-5. **Evaluation**: Reports Recall@K for K ∈ {50, 100, 200}.
-
-```bash
-# Evaluate on MIND val split
-python -m src.retrieval.semantic --dataset mind --split val --k 50 100 200
-
-# Force rebuild embeddings + index
-python -m src.retrieval.semantic --dataset mind --split val --rebuild
-```
-
-Results saved to `data/results/semantic_{dataset}_{split}.json`.
-
----
-
-## Anti-Gaming Tests (`tests/test_anti_gaming.py`)
-
-**Status: ✅ Complete**
-
-```bash
-pytest tests/ -v
-```
-
-Tests:
-- `TestSplitIntegrity` — train/val/test time windows do not overlap
-- `TestNoFutureLeakage` — all `impression_time` values are non-null (pre-condition for temporal ordering)
-- `TestSchemaIntegrity` — articles and behaviors conform to the unified schema
-- `test_labels_match_impressions_length` — every row has matching impressions/labels list lengths
-
----
-
-## What's Left (TODO)
-
-| Priority | Task | File |
-|----------|------|------|
-| 🔥 Next | Evaluation harness: AUC, MRR, nDCG@5/10, diversity | `src/evaluation/metrics.py` |
-| 🔥 Next | Submission file generator | `src/submission/generate.py` |
-| Later | LightGBM ranker (Day 3 plan) | `src/models/ranker.py` |
-| Later | Design note (≤4 pages) | `docs/design_note.md` |
-
----
-
-## Running on Kaggle
-
-Since data files are large, the full pipeline runs on Kaggle:
-
-```python
-# In Kaggle notebook — setup
-!git clone https://github.com/imchaitanya0/news-retrieval-system.git
-%cd news-retrieval-system
-!pip install -r requirements.txt -q
-
-# Pull latest changes
-!git pull origin main
-
-# Run pipeline
+# 3. Build processed parquets
 !python -m src.data.build_pipeline
 
-# Evaluate BM25
-!python -m src.retrieval.bm25 --dataset mind --split val
+# 4. Generate submission ZIPs (GPU-accelerated, ~10 minutes)
+!python -m src.submission.generate --dataset mind --split test --strategy hybrid
+!python -m src.submission.generate --dataset ebnerd --split test --strategy hybrid
 
-# Evaluate semantic
-!python -m src.retrieval.semantic --dataset mind --split val
+# ZIPs are at data/submissions/mind_test_hybrid.zip and ebnerd_test_hybrid.zip
 ```
 
 ---
 
-## Leaderboard Notes
+## Next: LightGBM Reranker
 
-- Codabench MIND: https://www.codabench.org/competitions/13967/
-- Codabench EB-NeRD: https://www.codabench.org/competitions/2469/
-- **Large datasets required for submission** — `ebnerd_large` + `MINDlarge` test sets
+The LightGBM ranker will train on the training behaviors using features:
+- BM25 score between user query and candidate
+- Semantic similarity score
+- Article recency (hours since publication)
+- Article popularity (global click count)
+- User history length (warm vs cold start)
+- Category match between user history and candidate
+
+Expected AUC improvement: `0.60 → 0.65+`
