@@ -265,53 +265,75 @@ def generate_submission(
     with open(out_path, "w") as out_f:
         for chunk_start in tqdm(range(0, n_behaviors, chunk_size), desc="Generating predictions"):
             batch = behaviors.slice(chunk_start, chunk_size).to_dicts()
-            bm25_queries, sem_queries = [], []
 
             for row in batch:
-                hist = row.get("history") or []
-                bm25_queries.append(build_query_from_history(hist, article_text_map, max_history) if retriever_bm25 else "")
-                sem_queries.append(build_user_vector(hist, embedding_map, max_history) if retriever_sem else None)
-
-            # Batch BM25
-            batch_bm25 = [[] for _ in batch]
-            if retriever_bm25:
-                import bm25s
-                k_val = min(200, len(retriever_bm25.article_ids))
-                tokens = bm25s.tokenize(bm25_queries, lower=True, show_progress=False)
-                res_idx, _ = retriever_bm25._index.retrieve(tokens, k=k_val, show_progress=False)
-                for r, indices in enumerate(res_idx):
-                    if bm25_queries[r]:
-                        batch_bm25[r] = [retriever_bm25.article_ids[idx] for idx in indices]
-
-            # Batch FAISS
-            batch_sem = [[] for _ in batch]
-            if retriever_sem:
-                valid_vecs, valid_map = [], []
-                for r, vec in enumerate(sem_queries):
-                    if vec is not None:
-                        valid_vecs.append(vec)
-                        valid_map.append(r)
-                if valid_vecs:
-                    k_val = min(200, len(retriever_sem.article_ids))
-                    _, I = retriever_sem._index.search(np.vstack(valid_vecs), k_val)
-                    for mi, indices in enumerate(I):
-                        batch_sem[valid_map[mi]] = [retriever_sem.article_ids[idx] for idx in indices]
-
-            # Fusion & write directly to file (no accumulation in RAM)
-            for r, row in enumerate(batch):
                 imp_id = row["impression_id"]
                 impressions = row.get("impressions") or []
                 if isinstance(impressions, str):
                     impressions = impressions.split()
                 if not impressions:
                     continue
-                ranked = rank_impressions(
-                    impressions=impressions,
-                    bm25_order=batch_bm25[r],
-                    semantic_order=batch_sem[r],
-                    strategy=strategy,
-                    labels=row.get("labels"),
-                )
+
+                hist = row.get("history") or []
+
+                sem_scores = {}
+                bm25_scores = {}
+
+                # --- Direct semantic scoring of candidates ---
+                if retriever_sem and hist:
+                    user_vec = build_user_vector(hist, embedding_map, max_history)
+                    if user_vec is not None:
+                        # Collect embeddings for only the impression candidates
+                        cand_vecs = []
+                        cand_ids = []
+                        for aid in impressions:
+                            if aid in embedding_map:
+                                cand_vecs.append(embedding_map[aid])
+                                cand_ids.append(aid)
+                        if cand_vecs:
+                            # Dot product = cosine sim (vecs are L2-normalized)
+                            scores = np.dot(np.array(cand_vecs), user_vec)
+                            for aid, sc in zip(cand_ids, scores):
+                                sem_scores[aid] = float(sc)
+
+                # --- Direct BM25 scoring of candidates ---
+                if retriever_bm25 and hist:
+                    query = build_query_from_history(hist, article_text_map, max_history)
+                    if query:
+                        import bm25s
+                        q_tokens = bm25s.tokenize([query], lower=True, show_progress=False)
+                        # Score only the candidate documents
+                        cand_texts = [article_text_map.get(aid, "") for aid in impressions]
+                        c_tokens = bm25s.tokenize(cand_texts, lower=True, show_progress=False)
+                        # Get scores via inner product of query against corpus of candidates
+                        # Rebuild mini-index for just this impression's candidates
+                        mini_idx = bm25s.BM25()
+                        mini_idx.index(c_tokens, show_progress=False)
+                        res, sc = mini_idx.retrieve(q_tokens, k=len(impressions), show_progress=False)
+                        for idx, score in zip(res[0], sc[0]):
+                            bm25_scores[impressions[idx]] = float(score)
+
+                # --- Fuse scores and rank ---
+                if strategy == "hybrid" and (sem_scores or bm25_scores):
+                    # Normalize each to [0,1] then combine
+                    def norm(d):
+                        if not d: return d
+                        mn, mx = min(d.values()), max(d.values())
+                        rng = mx - mn if mx != mn else 1.0
+                        return {k: (v - mn) / rng for k, v in d.items()}
+                    ns = norm(sem_scores)
+                    nb = norm(bm25_scores)
+                    combined = {}
+                    for aid in impressions:
+                        combined[aid] = 0.6 * ns.get(aid, 0.0) + 0.4 * nb.get(aid, 0.0)
+                    ranked = sorted(impressions, key=lambda a: -combined.get(a, 0.0))
+                elif strategy == "semantic" and sem_scores:
+                    ranked = sorted(impressions, key=lambda a: -sem_scores.get(a, 0.0))
+                elif strategy == "bm25" and bm25_scores:
+                    ranked = sorted(impressions, key=lambda a: -bm25_scores.get(a, 0.0))
+                else:
+                    ranked = list(impressions)
+
                 rank_map = {aid: rank for rank, aid in enumerate(ranked, 1)}
                 ranks = [str(rank_map.get(aid, len(ranked)+1)) for aid in impressions]
                 out_f.write(f"{imp_id} [{','.join(ranks)}]\n")
