@@ -43,7 +43,7 @@ def generate_submission(
 
     print(f"\n[Submit] {dataset}/{split} strategy={strategy}")
     articles  = pl.read_parquet(articles_path)
-    behaviors = pl.read_parquet(behaviors_path).sort("impression_id")
+    behaviors = pl.read_parquet(behaviors_path)
     n_imp = len(behaviors)
     print(f"  {n_imp:,} impressions")
 

@@ -161,16 +161,14 @@ def parse_ebnerd_behaviors(behaviors_df: pl.DataFrame, history_df: pl.DataFrame)
     df = df.drop("clicked_ids")
     return df
 
-def build_ebnerd_pipeline(split_ratio=(0.8, 0.1, 0.1)):
+def build_ebnerd_pipeline():
     """Process EB-NeRD data recursively, creating unified articles and behaviors."""
-    articles_frames = []
-    behaviors_frames = []
-    
     ebnerd_dir = RAW_DIR / "ebnerd"
     if not ebnerd_dir.exists():
         print("No EB-NeRD directory found.")
         return
 
+    articles_frames = []
     # Find all articles.parquet
     for articles_path in ebnerd_dir.rglob("articles.parquet"):
         print(f"Processing EB-NeRD articles from {articles_path.parent.name}...")
@@ -178,47 +176,36 @@ def build_ebnerd_pipeline(split_ratio=(0.8, 0.1, 0.1)):
         articles = parse_ebnerd_articles(articles, articles_path.parent.name)
         articles_frames.append(articles)
 
-    # Find all behaviors.parquet
+    if articles_frames:
+        all_articles = pl.concat(articles_frames).unique(subset=["article_id"])
+        PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+        all_articles.write_parquet(PROCESSED_DIR / "articles_ebnerd.parquet")
+    else:
+        print("No EB-NeRD articles found.")
+
+    # Find all behaviors.parquet and save them independently to avoid OOM and preserve order
     for behaviors_path in ebnerd_dir.rglob("behaviors.parquet"):
         history_path = behaviors_path.parent / "history.parquet"
         if not history_path.exists():
             continue
-        print(f"Processing EB-NeRD behaviors from {behaviors_path.parent.name}...")
+        folder = behaviors_path.parent.name.lower()
+        if "test" in folder:
+            split_name = "test"
+        elif "dev" in folder or "validation" in folder:
+            split_name = "val"
+        else:
+            split_name = "train"
+        
+        print(f"Processing EB-NeRD behaviors from {folder} (mapped to {split_name})...")
         behaviors = pl.read_parquet(behaviors_path)
         history = pl.read_parquet(history_path)
         behav_unified = parse_ebnerd_behaviors(behaviors, history)
-        behav_unified = behav_unified.with_columns(pl.lit(behaviors_path.parent.name).alias("split_original"))
-        behaviors_frames.append(behav_unified)
-
-    if not articles_frames or not behaviors_frames:
-        print("No EB-NeRD articles or behaviors found to concatenate.")
-        return
-
-    # Combine all articles
-    all_articles = pl.concat(articles_frames).unique(subset=["article_id"])
-    # Combine all behaviors
-    all_behaviors = pl.concat(behaviors_frames)
-    # Add a global temporal split
-    # Sort by impression_time, compute split based on date ranges
-    all_behaviors = all_behaviors.sort("impression_time")
-    # Compute total date range and split into train/val/test
-    min_time = all_behaviors["impression_time"].min()
-    max_time = all_behaviors["impression_time"].max()
-    total_days = (max_time - min_time).days
-    train_end = min_time + timedelta(days=int(total_days * split_ratio[0]))
-    val_end = train_end + timedelta(days=int(total_days * split_ratio[1]))
-    all_behaviors = all_behaviors.with_columns(
-        pl.when(pl.col("impression_time") <= train_end).then(pl.lit("train"))
-        .when(pl.col("impression_time") <= val_end).then(pl.lit("val"))
-        .otherwise(pl.lit("test")).alias("split")
-    )
-    # Save
-    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
-    all_articles.write_parquet(PROCESSED_DIR / "articles_ebnerd.parquet")
-    for split in ["train", "val", "test"]:
-        subset = all_behaviors.filter(pl.col("split") == split)
-        subset.write_parquet(PROCESSED_DIR / f"behaviors_ebnerd_{split}.parquet")
-    return all_articles, all_behaviors
+        
+        # Save directly without concat to preserve exact row order and save RAM
+        PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+        behav_unified.write_parquet(PROCESSED_DIR / f"behaviors_ebnerd_{split_name}.parquet")
+        
+    return
 
 def build_mind_pipeline(split_ratio=(0.8, 0.1, 0.1)):
     """Process MIND-small, create unified articles and behaviors parquets.
@@ -249,7 +236,6 @@ def build_mind_pipeline(split_ratio=(0.8, 0.1, 0.1)):
     articles = pl.concat(articles_frames).unique(subset=["article_id"])
 
     # Behaviors
-    behaviors_frames = []
     for behav_path in mind_dir.rglob("behaviors.tsv"):
         folder = behav_path.parent.name.lower()
         if "test" in folder:
@@ -264,23 +250,13 @@ def build_mind_pipeline(split_ratio=(0.8, 0.1, 0.1)):
             "impression_id", "user_id", "time", "history", "impressions"
         ])
         behav_unified = parse_mind_behaviors(behav_df)
-        behav_unified = behav_unified.with_columns(pl.lit(split_name).alias("split_original"))
-        behaviors_frames.append(behav_unified)
-    
-    if not behaviors_frames:
-        print("No MIND behaviors found.")
-        return
-    behaviors = pl.concat(behaviors_frames)
-    behaviors = behaviors.with_columns(pl.lit("MIND").alias("dataset"))
-
-    # Save
-    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
-    articles.write_parquet(PROCESSED_DIR / "articles_mind.parquet")
-    for split in behaviors["split_original"].unique():
-        subset = behaviors.filter(pl.col("split_original") == split)
-        subset.write_parquet(PROCESSED_DIR / f"behaviors_mind_{split}.parquet")
-    print(f"  MIND: {len(articles)} articles, {len(behaviors)} impressions saved.")
-    return articles, behaviors
+        behav_unified = behav_unified.with_columns(pl.lit("MIND").alias("dataset"))
+        
+        # Save directly to preserve exact row order (critical for Codabench)
+        PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+        behav_unified.write_parquet(PROCESSED_DIR / f"behaviors_mind_{split_name}.parquet")
+        
+    return
 
 def main():
     print("Building EB-NeRD pipeline...")

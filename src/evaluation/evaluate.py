@@ -49,7 +49,7 @@ def evaluate_submission(dataset: str, strategy: str, split: str = "val") -> dict
         )
 
     print(f"\n[Eval] {dataset}/{split} strategy={strategy}")
-    behaviors = pl.read_parquet(behaviors_path).sort("impression_id")
+    behaviors = pl.read_parquet(behaviors_path)
     articles  = pl.read_parquet(articles_path)
 
     # Build article lookup maps

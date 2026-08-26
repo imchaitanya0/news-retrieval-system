@@ -262,7 +262,7 @@ def inference(
     beh_path       = PROCESSED_DIR / f"behaviors_{dataset}_{split}.parquet"
 
     articles  = pl.read_parquet(articles_path)
-    behaviors = pl.read_parquet(beh_path).sort("impression_id")
+    behaviors = pl.read_parquet(beh_path)
 
     embs, ids = load_or_compute_embeddings(articles, dataset)
     embedding_map = dict(zip(ids, embs))
