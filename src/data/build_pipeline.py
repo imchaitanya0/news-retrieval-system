@@ -234,6 +234,8 @@ def build_mind_pipeline(split_ratio=(0.8, 0.1, 0.1)):
         print("No MIND articles found.")
         return
     articles = pl.concat(articles_frames).unique(subset=["article_id"])
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    articles.write_parquet(PROCESSED_DIR / "articles_mind.parquet")
 
     # Behaviors
     for behav_path in mind_dir.rglob("behaviors.tsv"):
