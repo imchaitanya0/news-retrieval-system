@@ -66,7 +66,12 @@ def generate_submission(
         if torch.cuda.is_available():
             emb_gpu = torch.tensor(emb_np).cuda()
             use_gpu = True
-            print(f"  GPU: {emb_gpu.shape} on {torch.cuda.get_device_name()}")
+            # Free transformer model from GPU memory before matmul
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+            free_gb = torch.cuda.mem_get_info()[0] / 1e9
+            print(f"  GPU: {emb_gpu.shape} on CUDA | {free_gb:.1f}GB free")
     except Exception:
         pass
     if not use_gpu:
@@ -115,7 +120,7 @@ def generate_submission(
     txt_path  = SUBMISSION_DIR / txt_name
 
     DIM        = emb_np.shape[1]
-    chunk_size = 8_000
+    chunk_size = 2000   # safe for T4: 2000 × 120K × 4B = 960MB well within 14GB
     n_written  = 0
 
     with open(out_path, "w") as out_f:
