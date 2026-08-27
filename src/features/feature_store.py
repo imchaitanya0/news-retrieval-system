@@ -71,7 +71,12 @@ def build_features(
     imp_ids = []
     art_ids = []
 
-    for row in behaviors.iter_rows(named=True):
+    try:
+        from tqdm import tqdm
+    except ImportError:
+        def tqdm(it, **kw): return it
+
+    for row in tqdm(behaviors.iter_rows(named=True), total=len(behaviors), desc="Building Features"):
         impressions = row.get("impressions") or []
         labels      = row.get("labels")      or []
         history     = row.get("history")     or []
