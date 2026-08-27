@@ -145,14 +145,14 @@ def train_pipeline(dataset: str, max_train_rows: int = 500_000):
     """
     Full training pipeline.
     
-    Parameters
-    ----------
-    dataset       : "mind" or "ebnerd"
-    max_train_rows: cap on training impressions to fit in RAM (default 500K)
+    L1/L2 Architecture:
+      This is the L2 Ranker. It expects the L1 stage (generate.py) to have
+      already selected candidates per impression. Here we train LightGBM on
+      those candidates using 6 in-memory features — no global index lookups.
     """
     from src.features.feature_store import build_features, FEATURE_NAMES
     from src.retrieval.semantic import load_or_compute_embeddings
-    from src.retrieval.bm25 import BM25Retriever, _article_text
+    from src.retrieval.bm25 import _article_text
 
     articles_path   = PROCESSED_DIR / f"articles_{dataset}.parquet"
     train_path      = PROCESSED_DIR / f"behaviors_{dataset}_train.parquet"
@@ -177,7 +177,6 @@ def train_pipeline(dataset: str, max_train_rows: int = 500_000):
     behaviors_val = None
     if val_path.exists():
         behaviors_val = pl.read_parquet(val_path)
-        # Filter to impressions with at least one positive label
         behaviors_val = behaviors_val.filter(
             pl.col("labels").list.sum() > 0
         )
@@ -189,43 +188,32 @@ def train_pipeline(dataset: str, max_train_rows: int = 500_000):
     embs, ids = load_or_compute_embeddings(articles, dataset)
     embedding_map = dict(zip(ids, embs))
 
-    # --- BM25 ---
-    print("  Loading BM25 index...")
-    index_path = Path("data/feature_store/bm25") / dataset
-    retriever_bm25 = BM25Retriever()
-    if (index_path / "bm25_index.pkl").exists():
-        retriever_bm25.load(index_path)
-    else:
-        retriever_bm25.build(articles)
-        retriever_bm25.save(index_path)
-
+    # --- Article text map for Lexical Overlap (L2 in-memory feature) ---
     art_rows = articles.select(["article_id", "title", "subtitle"]).to_dicts()
     article_text_map = {r["article_id"]: _article_text(r) for r in art_rows}
 
     # --- Popularity from train ---
     print("  Computing popularity...")
-    # Filter to positive clicks only
     pop_map = build_popularity_map(behaviors_train)
     print(f"  {len(pop_map):,} articles with click counts.")
 
-    # --- Build features ---
+    # --- Build features (GPU-accelerated) ---
     print("  Building train features...")
     X_tr, y_tr, g_tr, _, _ = build_features(
         behaviors_train, articles, embedding_map,
-        retriever_bm25, article_text_map, pop_map,
+        article_text_map=article_text_map,
+        popularity_map=pop_map,
     )
-    # Remove rows with label=-1 (test set rows, shouldn't appear in train)
     mask = y_tr >= 0
-    X_tr, y_tr, = X_tr[mask], y_tr[mask]
-    # Recompute groups after filtering (groups must stay consistent)
-    # Simpler: just use the full groups array (all train rows have real labels)
+    X_tr, y_tr = X_tr[mask], y_tr[mask]
 
     X_vl = y_vl = g_vl = None
     if behaviors_val is not None:
         print("  Building val features...")
         X_vl, y_vl, g_vl, _, _ = build_features(
             behaviors_val, articles, embedding_map,
-            retriever_bm25, article_text_map, pop_map,
+            article_text_map=article_text_map,
+            popularity_map=pop_map,
         )
 
     # --- Train ---
@@ -256,7 +244,7 @@ def inference(
     import shutil, zipfile
     from src.features.feature_store import build_features, FEATURE_NAMES
     from src.retrieval.semantic import load_or_compute_embeddings
-    from src.retrieval.bm25 import BM25Retriever, _article_text
+    from src.retrieval.bm25 import _article_text
 
     articles_path  = PROCESSED_DIR / f"articles_{dataset}.parquet"
     beh_path       = PROCESSED_DIR / f"behaviors_{dataset}_{split}.parquet"
@@ -267,57 +255,52 @@ def inference(
     embs, ids = load_or_compute_embeddings(articles, dataset)
     embedding_map = dict(zip(ids, embs))
 
-    index_path = Path("data/feature_store/bm25") / dataset
-    retriever_bm25 = BM25Retriever()
-    if (index_path / "bm25_index.pkl").exists():
-        retriever_bm25.load(index_path)
-    else:
-        retriever_bm25.build(articles)
-        retriever_bm25.save(index_path)
+    # Article text map for Lexical Overlap (L2 feature)
     art_rows = articles.select(["article_id", "title", "subtitle"]).to_dicts()
     article_text_map = {r["article_id"]: _article_text(r) for r in art_rows}
 
-    # Load popularity from saved train data if available
+    # Popularity from train
     pop_map = {}
     train_path = PROCESSED_DIR / f"behaviors_{dataset}_train.parquet"
     if train_path.exists():
         pop_map = build_popularity_map(pl.read_parquet(train_path).head(200_000))
 
-    print(f"  Building features for {len(behaviors):,} test impressions...")
+    print(f"  Building features for {len(behaviors):,} impressions...")
     X, y, groups, imp_ids, art_ids = build_features(
         behaviors, articles, embedding_map,
-        retriever_bm25, article_text_map, pop_map,
+        article_text_map=article_text_map,
+        popularity_map=pop_map,
     )
 
     print("  Running LGBM inference...")
     scores = ranker.predict(X)
 
     # Reconstruct per-impression rankings
-    from pathlib import Path as P
-    SUBMISSION_DIR = P("data/submissions")
+    # Build a fast index: impression_id -> original candidate list (O(N) one-time cost)
+    imp_to_orig = {}
+    for row in behaviors.select(["impression_id", "impressions"]).iter_rows(named=True):
+        imp_to_orig[row["impression_id"]] = row["impressions"] or []
+
+    SUBMISSION_DIR = Path("data/submissions")
     SUBMISSION_DIR.mkdir(parents=True, exist_ok=True)
     txt_name = "predictions.txt" if dataset == "ebnerd" else "prediction.txt"
     if out_path is None:
         out_path = SUBMISSION_DIR / f"{dataset}_{split}_lgbm.txt"
     txt_path = SUBMISSION_DIR / txt_name
 
-    # Group scores back by impression
     ptr = 0
     n_written = 0
     with open(out_path, "w") as f:
         for g_size in groups:
-            imp_id      = imp_ids[ptr]
-            imp_arts    = art_ids[ptr:ptr + g_size]
-            imp_scores  = scores[ptr:ptr + g_size]
-            imp_orig    = behaviors.filter(
-                pl.col("impression_id") == imp_id
-            )["impressions"][0] or []
+            imp_id     = imp_ids[ptr]
+            imp_arts   = art_ids[ptr:ptr + g_size]
+            imp_scores = scores[ptr:ptr + g_size]
+            imp_orig   = imp_to_orig.get(imp_id, imp_arts)
 
-            # Sort candidates by LGBM score
-            order   = np.argsort(-imp_scores)
-            ranked  = [imp_arts[i] for i in order]
+            order    = np.argsort(-imp_scores)
+            ranked   = [imp_arts[i] for i in order]
             rank_map = {aid: rk for rk, aid in enumerate(ranked, 1)}
-            ranks   = [str(rank_map.get(aid, g_size + 1)) for aid in imp_orig]
+            ranks    = [str(rank_map.get(aid, g_size + 1)) for aid in imp_orig]
             f.write(f"{imp_id} [{','.join(ranks)}]\n")
             n_written += 1
             ptr += g_size
@@ -329,6 +312,7 @@ def inference(
         zf.write(txt_path, arcname=txt_name)
     print(f"  Zip → {zip_path}")
     return out_path
+
 
 
 def main():
