@@ -132,8 +132,16 @@ def build_features(
     emb_np = np.array([embedding_map[aid] for aid in emb_id_list], dtype=np.float32)
 
     if use_gpu:
+        import gc
+        # Clear the sentence-transformer model from VRAM before we do matmul.
+        # The model was loaded by load_or_compute_embeddings and takes ~1.5GB.
+        # We only need the embedding numpy arrays from here on.
+        gc.collect()
+        torch.cuda.empty_cache()
         emb_gpu = torch.tensor(emb_np).cuda()  # (N_articles, 384)
         print(f"  GPU embedding matrix: {emb_gpu.shape} on CUDA ✓")
+        free_gb = (torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated()) / 1e9
+        print(f"  GPU VRAM free after loading matrix: {free_gb:.1f} GB")
     else:
         emb_gpu = emb_np
         print("  Running on CPU (GPU not available)")
@@ -170,11 +178,21 @@ def build_features(
             user_token_sets[i] = tok_set
 
     # ------------------------------------------------------------------
-    # GPU batch matmul → semantic scores for every (user, article) pair
-    # We only extract scores for specific candidates, not all 120K articles.
+    # GPU batch matmul → extract candidate-level semantic scores inline
+    # Instead of storing an (N_behaviors × N_articles) dense matrix (which
+    # would be 500K × 130K × 4B = 260GB!), we process chunks and immediately
+    # extract only the scores we need for the specific candidates.
     # ------------------------------------------------------------------
-    print("  GPU batch semantic scoring...")
-    sem_scores_all = np.zeros((n_behaviors, len(emb_id_list)), dtype=np.float32)
+    print("  GPU batch semantic scoring + feature assembly...")
+
+    # Pre-build per-impression candidate index lists for fast lookup
+    all_cand_indices = []
+    for row in all_rows:
+        impressions = row.get("impressions") or []
+        all_cand_indices.append([emb_id_to_idx.get(aid, -1) for aid in impressions])
+
+    # Store per-pair semantic scores (compact: one float per candidate pair)
+    all_sem_scores = []  # list of np.ndarray per impression
 
     for chunk_start in tqdm(range(0, n_behaviors, chunk_size), desc="GPU Batches"):
         chunk_end = min(chunk_start + chunk_size, n_behaviors)
@@ -183,10 +201,22 @@ def build_features(
         if use_gpu:
             uv_t   = torch.tensor(uv_batch).cuda()
             sc_all = torch.mm(uv_t, emb_gpu.T).cpu().numpy()  # (B, N_articles)
+            del uv_t  # free GPU immediately
         else:
-            sc_all = np.dot(uv_batch, emb_gpu.T)              # (B, N_articles)
+            sc_all = np.dot(uv_batch, emb_gpu.T)  # (B, N_articles)
 
-        sem_scores_all[chunk_start:chunk_end] = sc_all
+        # Extract only the candidate scores for this chunk
+        for i in range(chunk_end - chunk_start):
+            cand_idxs = all_cand_indices[chunk_start + i]
+            sem_row = []
+            for idx in cand_idxs:
+                sem_row.append(float(sc_all[i, idx]) if idx >= 0 else 0.0)
+            all_sem_scores.append(sem_row)
+
+        del sc_all  # free the large intermediate array immediately
+
+    if use_gpu:
+        torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------
     # Build final (N_pairs, 6) feature matrix
@@ -210,14 +240,13 @@ def build_features(
         hl          = int(hist_lens[i])
         uc          = user_cats[i]
         u_tokens    = user_token_sets[i] or set()
-        row_sem_vec = sem_scores_all[i]  # pre-computed (N_articles,)
+        sem_vec     = all_sem_scores[i]  # pre-extracted candidate scores
 
         for pos, (aid, lbl) in enumerate(
             zip(impressions, labels if labels else [-1] * n_cands), start=1
         ):
-            # Feature 1: Semantic similarity (GPU pre-computed)
-            idx = emb_id_to_idx.get(aid, -1)
-            sem = float(row_sem_vec[idx]) if idx >= 0 else 0.0
+            # Feature 1: Semantic similarity (pre-extracted per-candidate)
+            sem = sem_vec[pos - 1] if (pos - 1) < len(sem_vec) else 0.0
 
             # Feature 2: Lexical overlap (L2-stage local computation, O(|tokens|))
             cand_tokens = article_tokens.get(aid, set())
