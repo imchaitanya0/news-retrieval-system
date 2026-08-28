@@ -73,7 +73,7 @@ def build_features(
     article_text_map: dict = None,
     popularity_map: dict = None,
     max_history: int = 10,
-    chunk_size: int = 8000,
+    chunk_size: int = 1500,
 ) -> tuple:
     """
     Build feature matrix for all (impression, candidate) pairs via GPU batching.
