@@ -1,0 +1,431 @@
+# News Retrieval System — Complete Technical Reference
+## CS4.406: Information Retrieval & Extraction | Assignment 1 & 2
+
+---
+
+## 1. Repository Structure & File Map
+
+```
+news-retrieval-system/
+├── src/
+│   ├── data/
+│   │   ├── build_pipeline.py    — ETL: raw → unified parquet (A1 Q1)
+│   │   ├── download.py          — Dataset download helpers
+│   │   └── inspect.py           — Data inspection utilities
+│   ├── retrieval/
+│   │   ├── bm25.py              — BM25 inverted index (A1 Q2)
+│   │   ├── semantic.py          — Sentence-transformer + FAISS (A1 Q3)
+│   │   └── hybrid.py            — Weighted score fusion
+│   ├── features/
+│   │   └── feature_store.py     — 8-feature GPU-batched builder (A2 Q1)
+│   ├── ranking/
+│   │   ├── train_lgbm.py        — LightGBM LambdaMART (A2 Q2)
+│   │   └── ablation.py          — 4-variant ablation study (A2 Q3)
+│   ├── models/
+│   │   ├── nrms.py              — NRMS PyTorch architecture (A2 Q3)
+│   │   └── train_nrms.py        — NRMS training script (A2 Q3)
+│   ├── evaluation/
+│   │   ├── metrics.py           — AUC/MRR/nDCG/diversity/novelty/CI (A1 Q4)
+│   │   ├── evaluate.py          — Full eval harness + cold/warm + head/tail (A1 Q4)
+│   │   └── serving_benchmark.py — Latency/memory/cost benchmark (A2 Q4)
+│   └── submission/
+│       └── generate.py          — Codabench submission file builder (A1 Q5)
+├── tests/
+│   ├── test_anti_gaming.py      — Temporal leakage + schema + boundary tests (Q9)
+│   ├── test_bm25.py             — BM25 unit tests
+│   └── test_semantic.py         — Semantic retrieval unit tests
+├── screenshots/
+│   ├── MIND_submission.png      — MIND Codabench leaderboard
+│   └── EbNERD.png               — EB-NeRD Codabench leaderboard
+├── design_note.pdf              — A1 design note (≤4 pages)
+├── requirements.txt
+└── README.md
+```
+
+---
+
+## 2. Data Pipeline
+
+### Input Files
+| Dataset | File | Description |
+|---------|------|-------------|
+| MIND    | `MINDlarge_train/behaviors.tsv` | 15M impression logs (TSV) |
+| MIND    | `MINDlarge_train/news.tsv`      | 130K article metadata |
+| EB-NeRD | `ebnerd_large/train/behaviors.parquet` | Behavior logs |
+| EB-NeRD | `articles.parquet`                     | 120K+ articles |
+
+### Unified Schema (output parquets)
+**`data/processed/articles_{dataset}.parquet`**
+| Column | Type | Description |
+|--------|------|-------------|
+| dataset | str | "mind" or "ebnerd" |
+| article_id | str/int | Unique article identifier |
+| title | str | Article headline |
+| subtitle | str | Subtitle/abstract |
+| body | str | Full body text |
+| category | str | News category (e.g., "sports") |
+| subcategory | str | Sub-category |
+| published_time | datetime | Publication timestamp (used for freshness) |
+| popularity | float | Global click count |
+| entities | list[str] | Named entities in title |
+| abstract_entities | list[str] | Named entities in abstract |
+
+**`data/processed/behaviors_{dataset}_{split}.parquet`** (split ∈ {train, val, test})
+| Column | Type | Description |
+|--------|------|-------------|
+| dataset | str | "mind" or "ebnerd" |
+| impression_id | int | Unique impression identifier |
+| user_id | str | Anonymized user ID |
+| impression_time | datetime | When the impression was shown |
+| history | list[str] | Ordered list of previously clicked article IDs (oldest → newest) |
+| impressions | list[str] | Candidate article IDs shown in this impression |
+| labels | list[int] | 1=clicked, 0=not-clicked (empty in test split) |
+
+---
+
+## 3. Models & Components
+
+### 3.1 BM25 Retriever (`src/retrieval/bm25.py`)
+
+**What it does:** Builds a full-corpus inverted index over article `title + subtitle`. Given a user's click history, concatenates the titles of the most-recently-clicked articles into a query string, retrieves top-K candidates.
+
+**Algorithm:** BM25 Okapi (k1=1.5, b=0.75)
+
+**Input:**
+- Articles DataFrame with `article_id`, `title`, `subtitle`
+- User click history (list of article IDs)
+
+**Output:** Ranked list of article IDs (top-K)
+
+**Key functions:**
+- `BM25Retriever.build(articles)` — builds and caches the index
+- `BM25Retriever.retrieve(query, k=100)` — returns top-K article IDs
+- `evaluate_bm25(dataset, split, k_values=[50,100,200])` — computes Recall@K
+
+**CLI:**
+```bash
+python -m src.retrieval.bm25 --dataset mind --split val --k 50 100 200
+```
+
+**Evaluation metric:** Recall@K — fraction of ground-truth clicked articles that appear in the top-K retrieved set.
+
+---
+
+### 3.2 Semantic Retriever (`src/retrieval/semantic.py`)
+
+**What it does:** Encodes articles with `sentence-transformers`, stores in FAISS index, retrieves top-K by cosine similarity to user vector (mean of clicked article embeddings).
+
+**Model:** `paraphrase-multilingual-MiniLM-L12-v2`
+- Languages: multilingual (covers both English MIND and Danish EB-NeRD)
+- Embedding dim: **384**
+- Model size: ~471 MB
+
+**FAISS index:** `FlatIP` (exact inner product search = cosine similarity for L2-normalized vectors)
+
+**User representation:** Mean pool of the last 10 clicked article embeddings → 384-dim vector, L2-normalized.
+
+**Dimensions:**
+```
+Article embedding: (N_articles, 384)   e.g., (130379, 384) for MIND
+User vector:       (384,)
+FAISS index size:  N_articles × 384 × 4 bytes = ~200 MB for MIND
+```
+
+**Input:**
+- Articles DataFrame
+- User click history (list of article IDs)
+
+**Output:** Ranked list of top-K article IDs
+
+**CLI:**
+```bash
+python -m src.retrieval.semantic --dataset mind --split val --k 50 100 200
+```
+
+---
+
+### 3.3 Feature Store (`src/features/feature_store.py`)
+
+**What it does:** Computes 8 features for every (user, candidate article) pair in a batch.
+
+#### Feature Descriptions
+
+| # | Name | Formula | Why it matters |
+|---|------|---------|----------------|
+| 1 | `sem_score` | `dot(user_vec_decayed, cand_embedding)` | Topical similarity between user's current interest and candidate |
+| 2 | `lex_overlap` | `|user_tokens ∩ cand_tokens| / |user_tokens ∪ cand_tokens|` | Exact keyword match (Messi → Messi); catches specifics semantic models miss |
+| 3 | `log_popularity` | `log(1 + click_count_from_train)` | Cold-start fallback; popular articles are safe bets for new users |
+| 4 | `hist_len` | `min(len(history), 50)` | Distinguishes cold users (0) from power users (50); model weights features accordingly |
+| 5 | `cat_match` | `1 if cand_category == user_top_category` | User's dominant interest category alignment |
+| 6 | `inv_position` | `1 / editorial_position` | Captures editorial placement bias (position 1 = most visible) |
+| 7 | `freshness` | `exp(-hours_since_publish / 24)` | News quality degrades rapidly; day-old article gets 0.37, week-old gets <0.01 |
+| 8 | `recency_sem_score` | `dot(user_vec_last_3_clicks, cand_embedding)` | Short-term interest shift; captures sudden topic change (e.g., user just started reading tech after sports) |
+
+#### Recency-Weighted User Vector (Feature 1)
+```
+Standard mean pool:  user_vec = (1/n) Σ embedding_i          [outdated]
+Recency-weighted:    user_vec = Σ w_i × embedding_i          [ours]
+  where w_i = exp(-0.15 × (n-1-i)) / Σ exp(-0.15 × (n-1-j))
+  (i=0 oldest, i=n-1 newest; decay_rate=0.15)
+```
+
+#### GPU Batch Matrix Multiplication
+```python
+# For chunk of B=1500 users, N_articles=130K:
+sc_all = torch.mm(user_vectors_batch,    # (1500, 384)
+                  article_embeddings.T)  # (384, 130379)
+# → sc_all: (1500, 130379) — all dot products in one BLAS call
+# Immediately extract only the K candidate scores per impression
+# and delete sc_all to free 780MB of VRAM
+```
+
+**Input:**
+- behaviors: pl.DataFrame with history, impressions, labels, impression_time
+- articles: pl.DataFrame with article_id, category, published_time
+- embedding_map: dict {article_id → np.ndarray(384,)}
+- article_text_map: dict {article_id → "title subtitle" string}
+- popularity_map: dict {article_id → int click count}
+- article_publish_map: dict {article_id → datetime}
+
+**Output:** `(X, y, groups, imp_ids, art_ids)` where X has shape `(N_pairs, 8)`.
+
+---
+
+### 3.4 LightGBM Ranker (`src/ranking/train_lgbm.py`)
+
+**Algorithm:** LambdaMART (gradient boosted trees optimized for NDCG ranking)
+
+**Hyperparameters:**
+| Parameter | Value | Reason |
+|-----------|-------|--------|
+| objective | lambdarank | Directly optimizes ranking quality |
+| metric | ndcg | Evaluate at positions 5 and 10 |
+| learning_rate | 0.05 | Conservative to avoid overfitting |
+| num_leaves | 63 | Moderate complexity |
+| n_estimators | 300 (max) | Early stopping with patience=30 |
+| feature_fraction | 0.8 | Feature bagging for regularization |
+| bagging_fraction | 0.8 | Row bagging |
+| min_data_in_leaf | 20 | Prevents overfitting to tiny groups |
+
+**Training objective:** Maximize nDCG@5 on the validation set.
+
+**Label format:** Binary (0 = not clicked, 1 = clicked). `label_gain=[0, 1]`.
+
+**Input features:** X of shape (N_pairs, 8) from feature_store.py
+
+**Output:** Per-candidate relevance scores → argsort → ranked article list → Codabench submission file.
+
+**CLI:**
+```bash
+python -m src.ranking.train_lgbm --dataset mind    # trains + infers on test
+python -m src.ranking.train_lgbm --dataset ebnerd  # trains + infers on test
+```
+
+---
+
+### 3.5 NRMS Baseline (`src/models/nrms.py` + `src/models/train_nrms.py`)
+
+**Paper:** "Neural News Recommendation with Multi-head Self-Attention" (Wu et al., EMNLP 2019)
+
+**Architecture:**
+
+```
+News Encoder (per article):
+  1. Word Embedding:   title_ids (30 tokens) → word_embeddings (30, 300)
+  2. Linear projection: (30, 300) → (30, 200)
+  3. LayerNorm
+  4. Multi-head Self-Attention: 4 heads × 50-dim = 200-dim
+     Q=K=V: (30, 200) → (30, 200)  [attend each word to all others]
+  5. Residual connection: input + attn_out
+  6. Additive Attention Pool: W·tanh(q) → weight → weighted sum
+     (30, 200) → (200,)   [one vector per article]
+
+User Encoder:
+  1. Encode all history articles via News Encoder → (50, 200)
+  2. Multi-head Self-Attention over history news vectors
+     4 heads × 50-dim: (50, 200) → (50, 200)  [attend each article to all others]
+  3. Additive Attention Pool: (50, 200) → (200,)  [one user vector]
+
+Scoring:
+  score = dot(user_vector, candidate_news_vector)
+  During training: softmax over [1 pos + 4 neg] candidates
+  During inference: independent score for each candidate
+```
+
+**Dimensions:**
+| Component | Dimension |
+|-----------|-----------|
+| Vocabulary | ~50K words |
+| Word embedding | 300-dim |
+| Attention output | 200-dim |
+| News vector | 200-dim |
+| User vector | 200-dim |
+| Max title tokens | 30 |
+| Max history articles | 50 |
+| Negative samples/positive | 4 |
+| Total parameters | ~17M |
+
+**Training:**
+- Loss: Cross-entropy (softmax over 1+4 candidates)
+- Optimizer: Adam (lr=1e-3, weight_decay=1e-5)
+- Scheduler: OneCycleLR (peaks at epoch 1, decays to 0)
+- Gradient clipping: 1.0
+- Batch size: 32
+
+**CLI:**
+```bash
+python -m src.models.train_nrms --dataset mind --epochs 3
+python -m src.models.train_nrms --dataset ebnerd --epochs 3
+```
+
+**Expected runtime on Kaggle T4:** ~30-45 minutes per epoch
+
+---
+
+### 3.6 Ablation Study (`src/ranking/ablation.py`)
+
+Trains 4 LightGBM variants with progressively more features. Each is trained on the same data (200K train rows, 30K val rows), evaluated with 95% bootstrap CI.
+
+| Variant | Features Used | Purpose |
+|---------|---------------|---------|
+| A | sem_score only | Pure semantic signal baseline |
+| B | sem_score, lex_overlap | + lexical matching |
+| C | Original 6 (sem, lex, pop, hist, cat, pos) | Pre-A2 model |
+| D | All 8 (+ freshness, recency_sem_score) | Full A2 model |
+
+**CLI:**
+```bash
+python -m src.ranking.ablation --dataset mind
+python -m src.ranking.ablation --dataset ebnerd
+```
+
+---
+
+### 3.7 Evaluation Harness (`src/evaluation/metrics.py` + `evaluate.py`)
+
+#### Core Metrics
+| Metric | Formula | Interpretation |
+|--------|---------|----------------|
+| AUC | Area under ROC curve | Pairwise ranking quality (0.5=random, 1.0=perfect) |
+| MRR | 1/rank_of_first_clicked | How early does the first relevant item appear? |
+| nDCG@5 | DCG@5 / IDCG@5 | Quality of top-5 ranked items (position-discounted) |
+| nDCG@10 | DCG@10 / IDCG@10 | Quality of top-10 ranked items |
+
+#### Beyond-Accuracy Metrics
+| Metric | Formula | Interpretation |
+|--------|---------|----------------|
+| Diversity | unique_categories / k | Variety of topics in top-K recommendations |
+| Novelty | mean(-log2(pop_i/N)) | How unpopular are the recommended items? Higher = more novel |
+| Coverage | |recommended| / |all_articles| | Fraction of catalog ever recommended |
+
+#### Slices
+| Slice | Definition | Purpose |
+|-------|-----------|---------|
+| Cold users | history_len ≤ 5 | No behavioral data; popularity-based fallback |
+| Warm users | history_len > 5 | Rich behavioral data; semantic features useful |
+| Head articles | top 20% by appearance count | Popular articles; easy to rank correctly |
+| Tail articles | bottom 80% by appearance count | Niche articles; harder to rank; key for novelty |
+
+#### Bootstrap CI
+1000 resamples, 95% confidence interval (2.5th–97.5th percentile).
+
+**CLI:**
+```bash
+python -m src.evaluation.evaluate --dataset mind --strategy lgbm --split val
+python -m src.evaluation.evaluate --dataset ebnerd --strategy lgbm --split val
+```
+
+---
+
+### 3.8 Serving Benchmark (`src/evaluation/serving_benchmark.py`)
+
+**What it measures:**
+1. FAISS index peak memory (MB) via `tracemalloc`
+2. Embedding matrix size on disk and in memory
+3. LightGBM model file size
+4. p50/p95/p99 latency for 1000 random user requests
+5. Max QPS at p99 SLA
+6. Cost per 1000 queries (assuming T4-equivalent cloud)
+7. 10× scale analysis (what breaks and how to fix it)
+
+**CLI:**
+```bash
+python -m src.evaluation.serving_benchmark --dataset mind
+python -m src.evaluation.serving_benchmark --dataset ebnerd
+```
+
+---
+
+## 4. Evaluation Commands (Run on Kaggle)
+
+### A1 Requirements
+```bash
+# BM25 Recall@K (Q2)
+python -m src.retrieval.bm25 --dataset mind  --split val --k 50 100 200
+python -m src.retrieval.bm25 --dataset ebnerd --split val --k 50 100 200
+
+# Semantic Recall@K (Q3)
+python -m src.retrieval.semantic --dataset mind  --split val --k 50 100 200
+python -m src.retrieval.semantic --dataset ebnerd --split val --k 50 100 200
+
+# Full eval harness on LightGBM val predictions (Q4)
+python -m src.evaluation.evaluate --dataset mind  --strategy lgbm --split val
+python -m src.evaluation.evaluate --dataset ebnerd --strategy lgbm --split val
+```
+
+### A2 Requirements
+```bash
+# NRMS baseline (Q3)
+python -m src.models.train_nrms --dataset mind --epochs 3
+python -m src.models.train_nrms --dataset ebnerd --epochs 3
+
+# Retrain LightGBM with 8 features (Q2)
+python -m src.ranking.train_lgbm --dataset mind
+python -m src.ranking.train_lgbm --dataset ebnerd
+
+# Ablation study (Q3)
+python -m src.ranking.ablation --dataset mind
+python -m src.ranking.ablation --dataset ebnerd
+
+# Serving benchmark (Q4)
+python -m src.evaluation.serving_benchmark --dataset mind
+python -m src.evaluation.serving_benchmark --dataset ebnerd
+```
+
+---
+
+## 5. Why Each Choice Was Made (For Viva)
+
+### Why Polars instead of Pandas?
+Polars uses Rust under the hood and processes data in parallel. Reading 15M MIND behavior rows takes ~2s in Polars vs ~30s in Pandas, and uses ~3× less memory. Critical for Kaggle's 16GB RAM limit.
+
+### Why mean-pool → recency-weighted mean-pool?
+News reading interests shift rapidly. A user who read sports for a month but just clicked 3 tech articles in the last hour is interested in tech right now. Flat mean-pool would still show them sports. Exponential decay (decay_rate=0.15) gives the most-recent click ~1.5× the weight of a click 5 positions earlier.
+
+### Why lexical overlap instead of global BM25 query?
+For L1 retrieval (candidate generation), BM25 is standard. But we already have the candidates from the platform. Computing a full BM25 query over 130K articles for each of 6M users takes >2 hours on CPU. Since we only need to score 50 pre-provided candidates, Jaccard token overlap achieves exactly the same keyword-match signal in microseconds (pure set operations).
+
+### Why freshness feature?
+News has a unique "temporal decay" property. A story about a sports match result from last week is irrelevant today. `exp(-hours/24)` means: 0 hours old → score 1.0; 24 hours old → score 0.37; 7 days old → score 0.0009. The LightGBM model learns to penalize stale content.
+
+### Why LightGBM over neural ranker for L2?
+- LightGBM is interpretable (feature importances prove what signals matter)
+- Trains in minutes on CPU, not hours
+- Achieves competitive accuracy with hand-crafted features on small datasets
+- NRMS (our separate neural baseline) takes hours to train — having both satisfies the assignment requirement to reproduce AND improve
+
+### Why FAISS FlatIP for ANN?
+At 130K articles, brute-force exact search (FlatIP) takes <5ms per query. The overhead of approximation (IVF/HNSW) isn't justified below ~1M articles. At 10× scale, we would switch to IndexIVFFlat.
+
+### Temporal split (never random for interaction data)
+Random splitting would mean training on future clicks and evaluating on past clicks — data leakage. Instead: `train < val < test` in wall-clock time. The dataset provides this split natively (MIND: 6 weeks train + 1 week dev; EB-NeRD: similar).
+
+---
+
+## 6. Anti-Leakage Guarantees
+
+Three independent mechanisms prevent future-click leakage:
+
+1. **Temporal split:** `train.max_time ≤ val.min_time ≤ test.min_time` (asserted in `TestSplitIntegrity`)
+2. **Strong leakage test:** Joins history article `published_time` with `impression_time`, asserts no history article was published after the impression (asserted in `TestNoFutureLeakage.test_no_future_article_in_history`)
+3. **Test labels empty:** Test split has no positive labels — features cannot peek at click outcomes (asserted in `TestBehaviourWindowBoundary`)
