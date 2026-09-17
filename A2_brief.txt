@@ -1,0 +1,260 @@
+CS4.406: Information Retrieval & Extraction
+
+Assignment 2
+
+Assignment 2: Learning from Click-Logs on EB-NeRD and MIND
+CS4.406: Information Retrieval & Extraction
+News Recommendation Systems
+
+Due: September 20, 2026
+Type
+
+Teams of 2
+
+Prerequisite
+
+Assignment 1 (Lexical & Semantic Retrieval)
+
+Report Submission
+
+Moodle
+
+Competitions
+
+MIND (Codabench)
+
+RecSys 2024 Challenge (Codabench)
+
+Starter Code (EB-NeRD) https://github.com/jppol-ai/ebnerd-benchmark
+MIND Dataset
+
+https://huggingface.co/datasets/yjw1029/MIND
+
+EB-NeRD Dataset
+
+https://recsys.eb.dk/dataset/
+
+Note: You must register on Codabench and submit to both leaderboards.
+
+Introduction
+Build on the lexical and semantic retrieval pipeline from Assignment 1 to add behavioural
+signals from click-logs. You will implement a re-ranker, reproduce a baseline then beat it with an
+ablation, and analyse serving and scale. You will continue working with both MIND and EB-NeRD
+datasets. This is a team assignment — work in groups of two.
+Important
+Mandatory: You must register for both competitions on Codabench and submit your predictions to both leaderboards. Topping a leaderboard is not a necessity—though always
+appreciated—and grading is never on leaderboard rank. Register here:
+• MIND Competition: https://www.codabench.org/competitions/13967/
+• RecSys 2024 Challenge: https://www.codabench.org/competitions/2469/
+Datasets
+EB-NeRD (RecSys 2024 Challenge, Ekstra Bladet) [Kruse et al., 2024]: ∼2.7M users, 600M+
+impression logs, 120K+ articles with title/abstract/body and provided article embeddings. Demo/small/large bundles let you dial scale gradually. Danish language. The large bundle (ebnerd_large.zip
++ ebnerd_testset.zip) is required for Codabench submission — the test set has 13.5M
+impressions with no click labels.
+MIND (Microsoft News Dataset) [Wu et al., 2020]: ∼1M users, 160K+ English news articles
+with title/abstract/body and entity annotations, 15M+ impression logs. MIND-small for fast
+1
+
+CS4.406: Information Retrieval & Extraction
+
+Assignment 2
+
+iteration. The large test set (MINDlarge_test.zip) is required for Codabench submission
+— it contains 2.37M impressions with no click labels.
+Both tasks natively exercise all three modelling axes:
+• Lexical — titles/bodies (BM25, TF-IDF)
+• Semantic — article/text embeddings (Word2Vec, BERT, XLM-RoBERTa)
+• Behavioural — click history, recency/decay, session context
+Rapid news decay makes temporal splitting and freshness handling instructive. Both leaderboards
+are live, so you can submit and verify your solutions against them.
+What You Will Build
+1. Two-stage retrieve-then-rank — use Assignment 1’s candidate generator to retrieve top-K
+candidates, then train a re-ranker (GBDT or a small neural ranker) over engineered behavioural
+features.
+2. Click-history & session features — recency-weighted history, session context, article popularity/freshness, with strict behaviour-window boundary enforcement.
+3. Baseline reproduced, then beaten — reproduce the official/starter baseline, then one principled improvement with an ablation; claimed gains must ship a paired bootstrap 95% CI that
+excludes zero.
+4. Serving & scale analysis — index memory, p99 retrieval latency, and a back-of-envelope
+cost/QPS at a target SLA.
+5. Extended evaluation — all metrics (AUC, MRR, nDCG@5, nDCG@10, diversity, novelty,
+coverage) with slicing and bootstrap CIs.
+6. Report — what you built, choices and alternatives, observations, and where it breaks at 10×.
+
+Part 0: Datasets & Setup
+This assignment builds on Assignment 1. Download the datasets if you haven’t already.
+Important
+Large datasets are required for Codabench submissions. The small/demo sets are
+useful for development and debugging, but the test sets used by both leaderboards come from
+the large bundles only. Make sure to download the large test sets early — they are several
+GB each.
+EB-NeRD — download from S3:
+1
+2
+3
+
+# Small/demo for development
+wget https://ebnerd-dataset.s3.eu-west-1.amazonaws.com/ebnerd_demo.zip
+wget https://ebnerd-dataset.s3.eu-west-1.amazonaws.com/ebnerd_small.zip
+
+4
+5
+6
+
+# LARGE set (required for Codabench submission)
+wget https://ebnerd-dataset.s3.eu-west-1.amazonaws.com/ebnerd_large.zip
+
+2
+
+CS4.406: Information Retrieval & Extraction
+
+7
+8
+
+Assignment 2
+
+wget https://ebnerd-dataset.s3.eu-west-1.amazonaws.com/artifacts/articles_large_only.zip
+wget https://ebnerd-dataset.s3.eu-west-1.amazonaws.com/ebnerd_testset.zip
+
+9
+10
+11
+12
+
+# Pre-computed embeddings
+wget https://ebnerd-dataset.s3.eu-west-1.amazonaws.com/artifacts/Ekstra_Bladet_word2vec.zip
+wget https://ebnerd-dataset.s3.eu-west-1.amazonaws.com/artifacts/
+google_bert_base_multilingual_cased.zip
+
+MIND — download from HuggingFace:
+1
+2
+
+# Small set for development
+hf download yjw1029/MIND --repo-type dataset --local-dir MIND_data
+
+3
+4
+5
+6
+7
+
+# Or individual files:
+# MINDsmall_train.zip, MINDsmall_dev.zip
+# MINDlarge_test.zip
+# MINDlarge_train.zip, MINDlarge_dev.zip
+
+-- for development
+-- required for Codabench submission
+-- full-scale training
+
+Competition Registration: Register on both leaderboards:
+• MIND: https://www.codabench.org/competitions/13967/
+• RecSys 2024 Challenge: https://www.codabench.org/competitions/2469/
+Compute: Use free-tier GPUs (Google Colab, Kaggle, Lightning AI). The large EB-NeRD test set
+has 13.5M impressions and the MIND large test has 2.37M impressions — ensure your prediction
+pipeline is memory-efficient (use Polars, PyArrow, or batch processing).
+
+Part I: Learning from Click-Logs
+Team assignment (groups of 2). Due: September 20, 2026.
+Building on Assignment 1, you will add behavioural signals from click-logs, implement a reranker, reproduce a baseline then beat it with an ablation, and analyse serving and scale.
+Q1. Click-History & Session Features
+Engineer behavioural features from the click-logs for both datasets:
+1. Click-history features: User’s recent clicked articles (titles, categories, embeddings), click
+count, recency-weighted history (exponential decay)
+2. Session features: Within-session click patterns, dwell time (if available), position bias
+3. Article features: Popularity, freshness (time since publish), category match with user history
+4. Behavioural-window boundary: Enforce that no future clicks leak into features at training
+or serving time
+Q2. Re-Ranker
+Implement a two-stage retrieve-then-rank pipeline:
+1. Use Assignment 1’s candidate generator to retrieve top-K candidates (K ∼ 100–200)
+3
+
+CS4.406: Information Retrieval & Extraction
+
+Assignment 2
+
+2. Train a re-ranker over the engineered behavioural features:
+• Option A: GBDT (LightGBM/XGBoost) over hand-crafted features
+• Option B: A small neural ranker (e.g., NRMS-style [Wu et al., 2019] or a simple MLP)
+3. Score and re-rank the candidates
+4. Report AUC, MRR, nDCG@5, nDCG@10 before and after re-ranking
+Q3. Baseline Reproduced, Then Beaten
+1. Reproduce the official/starter baseline (e.g., NRMS from the ebnerd-benchmark repo, or the
+MIND baseline) on both datasets
+2. Improve with one principled change (e.g., better user encoding, attention over history, categoryaware features, freshness weighting)
+3. Ablation: Run an ablation study isolating the contribution of your improvement
+4. Statistical significance: Claimed gains must ship a paired bootstrap 95% CI that excludes
+zero
+Q4. Serving & Scale Analysis
+Analyse the serving characteristics of your system:
+1. Index memory: Measure the memory footprint of your ANN index and feature store
+2. Latency: Measure p99 retrieval latency (candidate generation + re-ranking) for a single user
+request
+3. Cost/QPS: Back-of-envelope estimate of cost per 1000 queries at a target SLA (e.g., p99 <
+100ms)
+4. Scaling argument: How would your system scale to 10× the current load? What breaks first?
+5. A measured local benchmark plus a scaling argument suffices
+Q5. Extended Evaluation
+Extend the evaluation harness from Assignment 1:
+• Report all metrics (AUC, MRR, nDCG@5, nDCG@10, diversity, novelty, coverage) for the full
+two-stage pipeline
+• Include at least two slices: cold-start vs. warm, head vs. tail
+• Bootstrap 95% CI for all reported metrics
+• Submit final predictions to both Codabench leaderboards and include screenshots
+
+4
+
+CS4.406: Information Retrieval & Extraction
+
+Assignment 2
+
+Q6. Design Note
+Write a concise design note as a PDF (6 pages target, 11pt, 1-inch margins) covering:
+• What you built and key design choices (re-ranker architecture, features)
+• Baseline vs. improved results with ablation and CI
+• Serving and scale analysis findings
+• Where your system breaks at 10× scale
+The 6-page target is a guideline, not a hard cap — you may extend it if your content justifies the
+extra length, but avoid padding. References and appendices do not count toward the target.
+
+Part II: Deliverables & Policies
+Q7. Deliverables
+1. Code: reproducible pipeline, model code, evaluation harness, prediction files, README.md with
+one-command reproduce. No large files — use .gitignore.
+2. Report (Moodle): what you built, choices, observations, where it breaks at 10×.
+3. Leaderboard screenshots from both Codabench competitions.
+4. AI usage log: all prompts, chat history exports, marking of AI-generated vs. human-written
+code.
+Q8. Git Commit Policy
+• Commit frequently with meaningful messages.
+• No large files in Git — ignore *.zip, *.pt, *.ckpt, __pycache__/, data/.
+• No force-pushes after the deadline.
+Q9. Anti-Gaming
+• Report metrics with and without features unavailable at serving time.
+• Enforce the behaviour-window boundary — no future-click leakage. Include a test asserting this.
+Important
+Grading note: Grading is never on leaderboard rank. Your grade is based on pipeline
+correctness, system design, ablation rigour, scale analysis, and design-note clarity.
+
+References
+5
+
+CS4.406: Information Retrieval & Extraction
+
+Assignment 2
+
+Johannes Kruse, Kasper Lindskow, Saikishore Kalloori, Marco Polignano, Claudio Pomo, Abhishek
+Srivastava, Anshuk Uppal, Michael Riis Andersen, and Jes Frellsen. Eb-nerd: A large-scale
+dataset for news recommendation. In Proceedings of the ACM RecSys Challenge 2024, 2024.
+Chuhan Wu, Fangzhao Wu, Suyu Ge, Tao Qi, Yongfeng Huang, and Xing Xie. Neural news recommendation with multi-head self-attention. In Proceedings of the 2019 Conference on Empirical
+Methods in Natural Language Processing and the 9th International Joint Conference on Natural
+Language Processing (EMNLP-IJCNLP), pages 6389–6394, 2019.
+Fangzhao Wu, Ying Qiao, Jiun-Hung Chen, Chuhan Wu, Tao Qi, Jianxun Lian, Danyang Liu,
+Xing Xie, Jianfeng Gao, Winnie Wu, and Ming Zhou. Mind: A large-scale dataset for news
+recommendation. In Proceedings of the 58th Annual Meeting of the Association for Computational
+Linguistics, pages 3597–3606, 2020.
+
+6
+
+

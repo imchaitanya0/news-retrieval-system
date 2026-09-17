@@ -1,12 +1,12 @@
 """
-LightGBM Learning-to-Rank Trainer & Inference (Q5)
-====================================================
+LightGBM Learning-to-Rank Trainer & Inference (A1 Q5 / A2 Q2)
+==============================================================
 Trains a LambdaMART ranker on the training behaviors, then uses it
 to rerank test impression candidates.
 
 Training flow:
   1. Load training behaviors (article_ids_inview + click labels)
-  2. Build 6 features per (user, candidate) pair via feature_store.py
+  2. Build 8 features per (user, candidate) pair via feature_store.py
   3. Train LightGBM with objective=lambdarank, eval_metric=ndcg
   4. Save model to data/models/lgbm_{dataset}.pkl
 
@@ -144,11 +144,11 @@ def build_popularity_map(behaviors_train: pl.DataFrame) -> dict:
 def train_pipeline(dataset: str, max_train_rows: int = 500_000):
     """
     Full training pipeline.
-    
+
     L1/L2 Architecture:
-      This is the L2 Ranker. It expects the L1 stage (generate.py) to have
-      already selected candidates per impression. Here we train LightGBM on
-      those candidates using 6 in-memory features — no global index lookups.
+      This is the L2 Ranker. It expects the L1 stage (bm25.py / semantic.py)
+      to have already selected candidates per impression. Here we train LightGBM
+      on those candidates using 8 in-memory features — no global index lookups.
     """
     from src.features.feature_store import build_features, FEATURE_NAMES
     from src.retrieval.semantic import load_or_compute_embeddings
@@ -188,21 +188,32 @@ def train_pipeline(dataset: str, max_train_rows: int = 500_000):
     embs, ids = load_or_compute_embeddings(articles, dataset)
     embedding_map = dict(zip(ids, embs))
 
-    # --- Article text map for Lexical Overlap (L2 in-memory feature) ---
+    # --- Article text map for Lexical Overlap feature ---
     art_rows = articles.select(["article_id", "title", "subtitle"]).to_dicts()
     article_text_map = {r["article_id"]: _article_text(r) for r in art_rows}
+
+    # --- Article publish time map for Freshness feature ---
+    pub_col = "published_time" if "published_time" in articles.columns else None
+    if pub_col:
+        article_publish_map = {
+            r["article_id"]: r[pub_col]
+            for r in articles.select(["article_id", pub_col]).to_dicts()
+        }
+    else:
+        article_publish_map = {}
 
     # --- Popularity from train ---
     print("  Computing popularity...")
     pop_map = build_popularity_map(behaviors_train)
     print(f"  {len(pop_map):,} articles with click counts.")
 
-    # --- Build features (GPU-accelerated) ---
+    # --- Build features (GPU-accelerated, 8 features) ---
     print("  Building train features...")
     X_tr, y_tr, g_tr, _, _ = build_features(
         behaviors_train, articles, embedding_map,
         article_text_map=article_text_map,
         popularity_map=pop_map,
+        article_publish_map=article_publish_map,
     )
     mask = y_tr >= 0
     X_tr, y_tr = X_tr[mask], y_tr[mask]
@@ -214,6 +225,7 @@ def train_pipeline(dataset: str, max_train_rows: int = 500_000):
             behaviors_val, articles, embedding_map,
             article_text_map=article_text_map,
             popularity_map=pop_map,
+            article_publish_map=article_publish_map,
         )
 
     # --- Train ---
@@ -255,9 +267,19 @@ def inference(
     embs, ids = load_or_compute_embeddings(articles, dataset)
     embedding_map = dict(zip(ids, embs))
 
-    # Article text map for Lexical Overlap (L2 feature)
+    # Article text map
     art_rows = articles.select(["article_id", "title", "subtitle"]).to_dicts()
     article_text_map = {r["article_id"]: _article_text(r) for r in art_rows}
+
+    # Article publish time map for freshness
+    pub_col = "published_time" if "published_time" in articles.columns else None
+    if pub_col:
+        article_publish_map = {
+            r["article_id"]: r[pub_col]
+            for r in articles.select(["article_id", pub_col]).to_dicts()
+        }
+    else:
+        article_publish_map = {}
 
     # Popularity from train
     pop_map = {}
@@ -270,6 +292,7 @@ def inference(
         behaviors, articles, embedding_map,
         article_text_map=article_text_map,
         popularity_map=pop_map,
+        article_publish_map=article_publish_map,
     )
 
     print("  Running LGBM inference...")

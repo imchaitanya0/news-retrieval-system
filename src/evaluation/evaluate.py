@@ -152,7 +152,7 @@ def evaluate_submission(dataset: str, strategy: str, split: str = "val") -> dict
     warm_ids = set(warm_df["impression_id"].to_list())
 
     for slice_name, slice_ids in [("cold", cold_ids), ("warm", warm_ids)]:
-        s_auc, s_mrr = [], []
+        s_auc, s_mrr, s_ndcg5 = [], [], []
         for row in behaviors.iter_rows(named=True):
             if row["impression_id"] not in slice_ids:
                 continue
@@ -168,13 +168,59 @@ def evaluate_submission(dataset: str, strategy: str, split: str = "val") -> dict
                 continue
             s_auc.append(compute_auc(int_labels, scores))
             s_mrr.append(compute_mrr(int_labels, scores))
+            s_ndcg5.append(compute_ndcg(int_labels, scores, 5))
 
         if s_auc:
-            print(f"  {slice_name:<6}: AUC={np.mean(s_auc):.4f}  MRR={np.mean(s_mrr):.4f}  n={len(s_auc):,}")
-            results[f"{slice_name}_AUC"] = round(float(np.mean(s_auc)), 4)
-            results[f"{slice_name}_MRR"] = round(float(np.mean(s_mrr)), 4)
+            print(f"  {slice_name:<6}: AUC={np.mean(s_auc):.4f}  MRR={np.mean(s_mrr):.4f}  nDCG@5={np.mean(s_ndcg5):.4f}  n={len(s_auc):,}")
+            results[f"{slice_name}_AUC"]    = round(float(np.mean(s_auc)), 4)
+            results[f"{slice_name}_MRR"]    = round(float(np.mean(s_mrr)), 4)
+            results[f"{slice_name}_nDCG@5"] = round(float(np.mean(s_ndcg5)), 4)
+
+    # --- Head/tail slice (A2 Q5 requirement) ---
+    # Head = top 20% of articles by global popularity (appear most in impressions)
+    # Tail = bottom 80% — less popular, harder to recommend
+    print("\n  [Head/Tail split]")
+    art_pop: dict = {}
+    for row in behaviors.iter_rows(named=True):
+        for aid in (row.get("impressions") or []):
+            art_pop[aid] = art_pop.get(aid, 0) + 1
+
+    if art_pop:
+        threshold = np.quantile(list(art_pop.values()), 0.80)
+        head_set  = {aid for aid, cnt in art_pop.items() if cnt >= threshold}
+        tail_set  = {aid for aid, cnt in art_pop.items() if cnt < threshold}
+
+        for slice_name, art_filter in [("head", head_set), ("tail", tail_set)]:
+            s_auc, s_mrr, s_ndcg5 = [], [], []
+            for row in behaviors.iter_rows(named=True):
+                imp_id      = row["impression_id"]
+                impressions = row.get("impressions") or []
+                labels      = row.get("labels")      or []
+
+                # Only score impressions that contain at least one article from this slice
+                slice_mask = [1 if aid in art_filter else 0 for aid in impressions]
+                if sum(slice_mask) == 0 or imp_id not in pred_ranks:
+                    continue
+
+                ranks      = pred_ranks[imp_id]
+                scores     = [-r for r in ranks]
+                int_labels = [int(l) for l in labels]
+                if len(set(int_labels)) < 2:
+                    continue
+                s_auc.append(compute_auc(int_labels, scores))
+                s_mrr.append(compute_mrr(int_labels, scores))
+                s_ndcg5.append(compute_ndcg(int_labels, scores, 5))
+
+            if s_auc:
+                print(f"  {slice_name:<6}: AUC={np.mean(s_auc):.4f}  MRR={np.mean(s_mrr):.4f}  nDCG@5={np.mean(s_ndcg5):.4f}  n={len(s_auc):,}  ({len(art_filter):,} articles)")
+                results[f"{slice_name}_AUC"]    = round(float(np.mean(s_auc)), 4)
+                results[f"{slice_name}_MRR"]    = round(float(np.mean(s_mrr)), 4)
+                results[f"{slice_name}_nDCG@5"] = round(float(np.mean(s_ndcg5)), 4)
+        results["head_n_articles"] = len(head_set)
+        results["tail_n_articles"] = len(tail_set)
 
     return results
+
 
 
 def main():
