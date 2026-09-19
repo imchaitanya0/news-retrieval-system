@@ -141,10 +141,37 @@ class SemanticRetriever:
         article_ids : list aligned with embedding rows
         """
         import faiss
+        import os
+
+        embeddings = np.ascontiguousarray(embeddings.astype('float32'))
         dim = embeddings.shape[1]
+        n = embeddings.shape[0]
         print(f"Building FAISS FlatIP index (dim={dim}, n={len(article_ids)}) ...")
-        self._index = faiss.IndexFlatIP(dim)
-        self._index.add(embeddings)
+
+        use_gpu = (
+            os.environ.get('FAISS_GPU', '1') == '1'
+            and hasattr(faiss, 'StandardGpuResources')
+            and hasattr(faiss, 'GpuIndexFlatIP')
+        )
+
+        if use_gpu:
+            try:
+                res = faiss.StandardGpuResources()
+                cfg = faiss.GpuIndexFlatConfig()
+                cfg.device = 0
+                cfg.useFloat16 = False
+                self._index = faiss.GpuIndexFlatIP(res, dim, cfg)
+                self._index.add(embeddings)
+                print(f"[semantic] GPU FAISS index — {n:,} vectors, dim={dim}")
+            except Exception as e:
+                print(f"[semantic] GPU index failed: {e}; using CPU")
+                self._index = faiss.IndexFlatIP(dim)
+                self._index.add(embeddings)
+                print(f"[semantic] CPU FAISS index — {n:,} vectors, dim={dim}")
+        else:
+            self._index = faiss.IndexFlatIP(dim)
+            self._index.add(embeddings)
+            print(f"[semantic] CPU FAISS index — {n:,} vectors, dim={dim}")
         self.article_ids = article_ids
         print(f"  Index ready.")
 
