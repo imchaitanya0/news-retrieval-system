@@ -208,7 +208,14 @@ class SemanticRetriever:
     def save(self, path: Path) -> None:
         import faiss
         path.mkdir(parents=True, exist_ok=True)
-        faiss.write_index(self._index, str(path / "faiss.index"))
+        
+        # GPU index cannot be serialized directly — move to CPU first
+        if hasattr(faiss, 'index_gpu_to_cpu') and hasattr(self._index, 'getDevice'):
+            cpu_index = faiss.index_gpu_to_cpu(self._index)
+            faiss.write_index(cpu_index, str(path / "faiss.index"))
+        else:
+            faiss.write_index(self._index, str(path / "faiss.index"))
+            
         with open(path / "article_ids.pkl", "wb") as f:
             pickle.dump(self.article_ids, f, protocol=4)
         print(f"  FAISS index saved to {path}")
@@ -216,21 +223,31 @@ class SemanticRetriever:
     def load(self, path: Path) -> None:
         import faiss
         import os
-        self._index = faiss.read_index(str(path / "faiss.index"))
+        cpu_index = faiss.read_index(str(path / "faiss.index"))
+        self._index = cpu_index
         with open(path / "article_ids.pkl", "rb") as f:
             self.article_ids = pickle.load(f)
         
         use_gpu = (
             os.environ.get('FAISS_GPU', '1') == '1'
-            and hasattr(faiss, 'StandardGpuResources')
+            and hasattr(faiss, 'GpuIndexFlatIP')
         )
         if use_gpu:
             try:
+                # Extract raw vectors from CPU index
+                n = cpu_index.ntotal
+                d = cpu_index.d
+                vecs = cpu_index.reconstruct_n(0, n)
                 res = faiss.StandardGpuResources()
-                self._index = faiss.index_cpu_to_gpu(res, 0, self._index)
+                cfg = faiss.GpuIndexFlatConfig()
+                cfg.device = 0
+                cfg.useFloat16 = False
+                gpu = faiss.GpuIndexFlatIP(res, d, cfg)
+                gpu.add(vecs)
+                self._index = gpu
                 print(f"  FAISS index loaded & moved to GPU ({len(self.article_ids)} articles)")
             except Exception as e:
-                print(f"  FAISS index loaded on CPU ({len(self.article_ids)} articles)")
+                print(f"  FAISS GPU load failed: {e}. Using CPU ({len(self.article_ids)} articles)")
         else:
             print(f"  FAISS index loaded on CPU ({len(self.article_ids)} articles)")
 

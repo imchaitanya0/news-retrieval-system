@@ -472,3 +472,13 @@ Throughout the development and Kaggle deployment of this pipeline, we faced seve
 - **Error:** `TypeError: SemanticRetriever.build() takes 2 positional arguments but 3 were given`
 - **Root Cause:** The benchmark script was passing the entire DataFrame `articles` to `SemanticRetriever.build()`, but the updated signature expected `(embeddings: np.ndarray, article_ids: list)`.
 - **Solution:** Updated the benchmark to call `load_or_compute_embeddings()` first, then pass the resulting raw `numpy` arrays directly to the builder.
+
+### 7.7 FAISS GPU Index Serialization Bug
+- **Error:** `RuntimeError: Error in virtual void faiss::Index::write_index(...)` when calling `faiss.write_index` on a GPU index.
+- **Root Cause:** FAISS `GpuIndexFlatIP` cannot be written directly to disk via `write_index()`. Furthermore, loading an index with `faiss.read_index()` always yields a CPU index. When we used `faiss.index_cpu_to_gpu()`, it crashed because it doesn't natively support translating loaded CPU `IndexFlatIP` instances on some GPU architectures without the proper cloner.
+- **Solution:**
+  1. **Saving:** Modified `save()` to use `faiss.index_gpu_to_cpu()` before writing to disk. This costs a negligible ~0.2s VRAM-to-RAM transfer.
+  2. **Loading:** Modified `load()` to bypass `index_cpu_to_gpu()`. Instead, we extract the raw vectors directly from the loaded CPU index using `cpu_index.reconstruct_n(0, n)` and explicitly reconstruct a new `GpuIndexFlatIP` object in memory. 
+- **Numbers:** 
+  - VRAM to RAM Transfer Size: `130,379 x 384 x 4 bytes` = ~200 MB.
+  - Transfer Latency: ~0.2 seconds.
