@@ -177,9 +177,9 @@ def parse_ebnerd_articles(df: pl.DataFrame) -> pl.DataFrame:
 
     # Subcategory may be a list
     if "subcategory" in df.columns:
-        if df["subcategory"].dtype == pl.List(pl.Utf8):
+        if "List" in str(df["subcategory"].dtype):
             df = df.with_columns(
-                pl.col("subcategory").list.join(",")
+                pl.col("subcategory").cast(pl.List(pl.Utf8)).list.join(",")
             )
         else:
             df = df.with_columns(pl.col("subcategory").cast(pl.Utf8))
