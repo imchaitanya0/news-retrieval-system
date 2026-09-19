@@ -429,3 +429,46 @@ Three independent mechanisms prevent future-click leakage:
 1. **Temporal split:** `train.max_time ≤ val.min_time ≤ test.min_time` (asserted in `TestSplitIntegrity`)
 2. **Strong leakage test:** Joins history article `published_time` with `impression_time`, asserts no history article was published after the impression (asserted in `TestNoFutureLeakage.test_no_future_article_in_history`)
 3. **Test labels empty:** Test split has no positive labels — features cannot peek at click outcomes (asserted in `TestBehaviourWindowBoundary`)
+
+---
+
+## 7. Troubleshooting & Bug Fixes History (For Exam Prep)
+
+Throughout the development and Kaggle deployment of this pipeline, we faced several technical roadblocks. Understanding *why* they happened and *how* they were fixed is critical for exam preparation.
+
+### 7.1 FAISS Semantic Retrieval Too Slow (2 hours)
+- **Error/Symptom:** Running Semantic Recall@K took over 2 hours on Kaggle T4 GPU.
+- **Root Cause:** In `src/retrieval/semantic.py`, the code was unconditionally instantiating `faiss.IndexFlatIP(dim)` which runs exclusively on the CPU. The cell-level `os.environ['FAISS_GPU']` patch in the notebook was not propagating to the subprocess.
+- **Solution:** Edited `semantic.py` to dynamically check for `faiss.StandardGpuResources` and `faiss.GpuIndexFlatIP`. If available, it loads the embeddings onto the GPU VRAM.
+- **Numbers:** 
+  - CPU FAISS: ~2 hours for 376K validation queries.
+  - GPU FAISS: ~2 minutes. 
+  - Index size: 130,379 vectors × 384 dimensions × 4 bytes = ~200 MB (easily fits in 15GB T4 VRAM).
+
+### 7.2 EB-NeRD Pipeline: `DuplicateError: column 'category' is duplicate`
+- **Error:** Polars threw `DuplicateError` when running `build_pipeline.py`.
+- **Root Cause:** EB-NeRD's `articles.parquet` had an existing `category` column (from upstream updates), and our script tried to unconditionally rename `category_str` to `category`. Polars forbids duplicate column names.
+- **Solution:** Updated the rename logic: if `category` already exists, we safely drop `category_str` instead of renaming it. 
+
+### 7.3 EB-NeRD Pipeline: `InvalidOperationError: cannot cast List type (inner: 'Int16', to: 'String')`
+- **Error:** Occurred during subcategory normalization in `build_pipeline.py`.
+- **Root Cause:** EB-NeRD's `subcategory` column was stored as a list of integers (`List(Int16)`). We attempted to cast it directly to `Utf8` (String). Polars cannot cast a list of integers directly into a single string.
+- **Solution:** Added a dtype check `if "List" in str(df["subcategory"].dtype):`. If it's a list, we first cast it to a list of strings `cast(pl.List(pl.Utf8))` and then use `.list.join(",")` to flatten it into a single comma-separated string.
+- **Numbers:** 
+  - Input: `[12, 45]` (Type: `List(Int16)`)
+  - Output: `"12,45"` (Type: `Utf8`)
+
+### 7.4 NumPy Array Indexing Error in Evaluation
+- **Error:** `TypeError: only integer scalar arrays can be converted to a scalar index` in `metrics.py`.
+- **Root Cause:** During evaluation, the ground truth labels array was being indexed using `i` where `i` was a numpy array (e.g., `labels[np.array([2])]`) instead of an integer (`labels[2]`). 
+- **Solution:** Forced standard Python integer casting via `labels[int(i)]`.
+
+### 7.5 Type Mismatch on `impression_id`
+- **Error:** Impressions from the LightGBM prediction text file couldn't be joined with the validation Parquet file.
+- **Root Cause:** The text file parser read `impression_id` as a string (`"12345"`), but the Parquet schema stored it as an integer (`12345`). Dictionary lookups failed silently resulting in zero metrics.
+- **Solution:** Normalized all `impression_id` keys to integers using `int(imp_id)` when building the lookup maps in memory.
+
+### 7.6 Serving Benchmark Signature Mismatch
+- **Error:** `TypeError: SemanticRetriever.build() takes 2 positional arguments but 3 were given`
+- **Root Cause:** The benchmark script was passing the entire DataFrame `articles` to `SemanticRetriever.build()`, but the updated signature expected `(embeddings: np.ndarray, article_ids: list)`.
+- **Solution:** Updated the benchmark to call `load_or_compute_embeddings()` first, then pass the resulting raw `numpy` arrays directly to the builder.
