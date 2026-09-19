@@ -161,9 +161,17 @@ def parse_ebnerd_articles(df: pl.DataFrame) -> pl.DataFrame:
     """
     rename_map = {}
     if "category_str" in df.columns:
-        rename_map["category_str"] = "category"
+        if "category" not in df.columns:
+            rename_map["category_str"] = "category"
+        else:
+            df = df.drop("category_str")
+            
     if "total_inviews" in df.columns:
-        rename_map["total_inviews"] = "popularity"
+        if "popularity" not in df.columns:
+            rename_map["total_inviews"] = "popularity"
+        else:
+            df = df.drop("total_inviews")
+            
     if rename_map:
         df = df.rename(rename_map)
 
