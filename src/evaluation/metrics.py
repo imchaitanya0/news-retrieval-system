@@ -29,25 +29,34 @@ RESULTS_DIR = Path("data/results")
 
 def compute_auc(labels: list, scores: list) -> float:
     """AUC for a single impression. Returns 0.5 if only one class."""
+    labels = [int(l) for l in labels]
+    scores = [float(s) for s in scores]
     if len(set(labels)) < 2:
         return 0.5
-    return float(roc_auc_score(labels, scores))
+    try:
+        return float(roc_auc_score(labels, scores))
+    except Exception:
+        return 0.5
 
 
 def compute_mrr(labels: list, scores: list) -> float:
     """MRR: reciprocal rank of the first relevant item in ranked list."""
-    order = np.argsort(scores)[::-1]
+    labels = [int(l) for l in labels]
+    scores_arr = np.array([float(s) for s in scores])
+    order = np.argsort(scores_arr)[::-1]
     for rank, idx in enumerate(order, 1):
-        if labels[idx] == 1:
+        if labels[int(idx)] == 1:
             return 1.0 / rank
     return 0.0
 
 
 def compute_ndcg(labels: list, scores: list, k: int) -> float:
     """nDCG@k for a single impression."""
-    order = np.argsort(scores)[::-1][:k]
-    dcg = sum(labels[i] / np.log2(r + 2) for r, i in enumerate(order))
-    ideal = sorted(labels, reverse=True)[:k]
+    labels_arr = [int(l) for l in labels]
+    scores_arr = np.array([float(s) for s in scores])
+    order = np.argsort(scores_arr)[::-1][:k]
+    dcg  = sum(labels_arr[int(i)] / np.log2(r + 2) for r, i in enumerate(order))
+    ideal = sorted(labels_arr, reverse=True)[:k]
     idcg = sum(v / np.log2(r + 2) for r, v in enumerate(ideal))
     return dcg / idcg if idcg > 0 else 0.0
 

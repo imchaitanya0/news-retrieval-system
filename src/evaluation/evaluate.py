@@ -17,6 +17,11 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(it, **kw): return it
+
 from src.evaluation.metrics import (
     compute_auc, compute_mrr, compute_ndcg,
     intra_list_diversity, novelty, catalog_coverage,
@@ -66,17 +71,20 @@ def evaluate_submission(dataset: str, strategy: str, split: str = "val") -> dict
     all_article_ids = set(articles["article_id"].to_list())
 
     # --- Parse prediction file ---
-    # Format: "{imp_id} [{r1},{r2},...}]"
-    pred_ranks: dict = {}   # imp_id -> list of int ranks (1-indexed)
+    # Format: "{imp_id} [{r1},{r2},...]"
+    pred_ranks: dict = {}   # imp_id (int) -> list of int ranks (1-indexed)
     with open(pred_path) as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             parts = line.split(" ", 1)
-            imp_id = int(parts[0])
+            try:
+                imp_id_key = int(parts[0])
+            except ValueError:
+                imp_id_key = parts[0]   # fallback to str
             ranks_str = parts[1].strip("[]")
-            pred_ranks[imp_id] = [int(r) for r in ranks_str.split(",")]
+            pred_ranks[imp_id_key] = [int(r) for r in ranks_str.split(",")]
 
     # --- Evaluate ---
     auc_vals, mrr_vals = [], []
@@ -84,16 +92,18 @@ def evaluate_submission(dataset: str, strategy: str, split: str = "val") -> dict
     div_vals, nov_vals = [], []
     all_recommended = set()
 
-    for row in behaviors.iter_rows(named=True):
+    for row in tqdm(behaviors.iter_rows(named=True), total=len(behaviors), desc="Evaluating"):
         imp_id      = row["impression_id"]
+        # Normalize type: pred_ranks keys are int, but Polars may give str for some datasets
+        imp_id_key  = int(imp_id) if isinstance(imp_id, (int, float)) else imp_id
         impressions = row.get("impressions") or []
         labels      = row.get("labels")      or []
 
-        if not impressions or imp_id not in pred_ranks:
+        if not impressions or imp_id_key not in pred_ranks:
             continue
 
         # Build scores from predicted ranks (lower rank = higher score)
-        ranks = pred_ranks[imp_id]
+        ranks = pred_ranks[imp_id_key]
         if len(ranks) != len(impressions):
             continue
 
@@ -110,8 +120,10 @@ def evaluate_submission(dataset: str, strategy: str, split: str = "val") -> dict
         ndcg10_vals.append(compute_ndcg(int_labels, scores, 10))
 
         # Beyond-accuracy: use top-10 predicted articles
-        order    = np.argsort(ranks)[:10]   # lowest rank first = best ranked
-        top10    = [impressions[i] for i in order]
+        # FIX: sort by score (= -rank), not by ranks directly
+        scores_arr = np.array(scores)
+        order      = np.argsort(scores_arr)[::-1][:10]
+        top10      = [impressions[int(i)] for i in order]
         div_vals.append(intra_list_diversity(top10, category_map))
         nov_vals.append(novelty(top10, pop_map, n_total))
         all_recommended.update(top10)
@@ -154,14 +166,15 @@ def evaluate_submission(dataset: str, strategy: str, split: str = "val") -> dict
     for slice_name, slice_ids in [("cold", cold_ids), ("warm", warm_ids)]:
         s_auc, s_mrr, s_ndcg5 = [], [], []
         for row in behaviors.iter_rows(named=True):
-            if row["impression_id"] not in slice_ids:
+            imp_id = row["impression_id"]
+            imp_id_key = int(imp_id) if isinstance(imp_id, (int, float)) else imp_id
+            if imp_id_key not in slice_ids:
                 continue
-            imp_id      = row["impression_id"]
             impressions = row.get("impressions") or []
             labels      = row.get("labels")      or []
-            if not impressions or imp_id not in pred_ranks:
+            if not impressions or imp_id_key not in pred_ranks:
                 continue
-            ranks  = pred_ranks[imp_id]
+            ranks  = pred_ranks[imp_id_key]
             scores = [-r for r in ranks]
             int_labels = [int(l) for l in labels]
             if len(set(int_labels)) < 2:
@@ -193,16 +206,16 @@ def evaluate_submission(dataset: str, strategy: str, split: str = "val") -> dict
         for slice_name, art_filter in [("head", head_set), ("tail", tail_set)]:
             s_auc, s_mrr, s_ndcg5 = [], [], []
             for row in behaviors.iter_rows(named=True):
-                imp_id      = row["impression_id"]
+                imp_id = row["impression_id"]
+                imp_id_key = int(imp_id) if isinstance(imp_id, (int, float)) else imp_id
                 impressions = row.get("impressions") or []
                 labels      = row.get("labels")      or []
 
-                # Only score impressions that contain at least one article from this slice
                 slice_mask = [1 if aid in art_filter else 0 for aid in impressions]
-                if sum(slice_mask) == 0 or imp_id not in pred_ranks:
+                if sum(slice_mask) == 0 or imp_id_key not in pred_ranks:
                     continue
 
-                ranks      = pred_ranks[imp_id]
+                ranks      = pred_ranks[imp_id_key]
                 scores     = [-r for r in ranks]
                 int_labels = [int(l) for l in labels]
                 if len(set(int_labels)) < 2:
@@ -226,7 +239,8 @@ def evaluate_submission(dataset: str, strategy: str, split: str = "val") -> dict
 def main():
     p = argparse.ArgumentParser(description="Evaluate submission (Q4)")
     p.add_argument("--dataset",  choices=["mind", "ebnerd"], default="mind")
-    p.add_argument("--strategy", default="hybrid")
+    p.add_argument("--strategy", default="lgbm",
+                   help="Strategy name matching the prediction filename (lgbm, hybrid, semantic)")
     p.add_argument("--split",    default="val")
     args = p.parse_args()
 

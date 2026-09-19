@@ -311,14 +311,21 @@ def inference(
         out_path = SUBMISSION_DIR / f"{dataset}_{split}_lgbm.txt"
     txt_path = SUBMISSION_DIR / txt_name
 
+    try:
+        from tqdm import tqdm as _tqdm
+    except ImportError:
+        def _tqdm(it, **kw): return it
+
     ptr = 0
     n_written = 0
     with open(out_path, "w") as f:
-        for g_size in groups:
+        for g_size in _tqdm(groups, desc=f"Writing {split} predictions"):
             imp_id     = imp_ids[ptr]
+            # Normalize imp_id type to match imp_to_orig keys
+            imp_id_key = int(imp_id) if not isinstance(imp_id, str) else imp_id
             imp_arts   = art_ids[ptr:ptr + g_size]
             imp_scores = scores[ptr:ptr + g_size]
-            imp_orig   = imp_to_orig.get(imp_id, imp_arts)
+            imp_orig   = imp_to_orig.get(imp_id_key, imp_arts)
 
             order    = np.argsort(-imp_scores)
             ranked   = [imp_arts[i] for i in order]
@@ -339,26 +346,37 @@ def inference(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="LightGBM Ranker (Q5)")
-    parser.add_argument("--dataset", choices=["mind", "ebnerd"], required=True)
+    parser = argparse.ArgumentParser(description="LightGBM Ranker (A1 Q5 / A2 Q2)")
+    parser.add_argument("--dataset",        choices=["mind", "ebnerd"], required=True)
     parser.add_argument("--max-train-rows", type=int, default=500_000)
-    parser.add_argument("--infer", action="store_true",
-                        help="Run inference instead of training")
-    parser.add_argument("--split", default="test")
+    parser.add_argument("--infer",          action="store_true",
+                        help="Run inference only (skip training)")
+    parser.add_argument("--split",          default="test",
+                        help="Split to run inference on (test, val)")
     args = parser.parse_args()
 
     model_path = MODELS_DIR / f"lgbm_{args.dataset}.pkl"
 
     if args.infer:
+        if not model_path.exists():
+            raise FileNotFoundError(
+                f"Model not found: {model_path}. Train first (remove --infer)."
+            )
         ranker = LGBMRanker()
         ranker.load(model_path)
         inference(ranker, args.dataset, args.split)
     else:
         train_pipeline(args.dataset, args.max_train_rows)
-        # Run inference on test set immediately after training
         ranker = LGBMRanker()
         ranker.load(model_path)
+        # Generate val predictions (for evaluate.py)
+        print("\n--- Generating VAL predictions for evaluation ---")
+        inference(ranker, args.dataset, "val",
+                  out_path=Path("data/submissions") / f"{args.dataset}_val_lgbm.txt")
+        # Generate test predictions (for Codabench submission)
+        print("\n--- Generating TEST predictions for Codabench ---")
         inference(ranker, args.dataset, "test")
+
 
 
 if __name__ == "__main__":
