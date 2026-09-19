@@ -215,10 +215,24 @@ class SemanticRetriever:
 
     def load(self, path: Path) -> None:
         import faiss
+        import os
         self._index = faiss.read_index(str(path / "faiss.index"))
         with open(path / "article_ids.pkl", "rb") as f:
             self.article_ids = pickle.load(f)
-        print(f"  FAISS index loaded ({len(self.article_ids)} articles)")
+        
+        use_gpu = (
+            os.environ.get('FAISS_GPU', '1') == '1'
+            and hasattr(faiss, 'StandardGpuResources')
+        )
+        if use_gpu:
+            try:
+                res = faiss.StandardGpuResources()
+                self._index = faiss.index_cpu_to_gpu(res, 0, self._index)
+                print(f"  FAISS index loaded & moved to GPU ({len(self.article_ids)} articles)")
+            except Exception as e:
+                print(f"  FAISS index loaded on CPU ({len(self.article_ids)} articles)")
+        else:
+            print(f"  FAISS index loaded on CPU ({len(self.article_ids)} articles)")
 
 
 # --------------------------------------------------------------------- #
@@ -232,19 +246,6 @@ def build_user_vector(
 ) -> np.ndarray | None:
     """
     Compute user vector as mean of the most recent clicked article embeddings.
-
-    Parameters
-    ----------
-    history : list
-        Ordered list of article_id (oldest first).
-    embedding_map : dict
-        {article_id: np.ndarray (D,)} lookup.
-    max_articles : int
-        How many recent articles to use.
-
-    Returns
-    -------
-    np.ndarray (D,) float32, or None if no valid embeddings found.
     """
     recent = history[-max_articles:] if history else []
     vecs = [embedding_map[aid] for aid in recent if aid in embedding_map]
@@ -274,20 +275,6 @@ def evaluate_semantic(
     k_values: list = None,
     max_history: int = 10,
 ) -> dict:
-    """
-    Run semantic retrieval and report Recall@K.
-
-    Parameters
-    ----------
-    dataset : str   "mind" or "ebnerd"
-    split : str     "train", "val", or "test"
-    k_values : list K values (default [50, 100, 200])
-    max_history : int  max recent articles for user vector
-
-    Returns
-    -------
-    dict mapping "recall@K" -> float
-    """
     if k_values is None:
         k_values = [50, 100, 200]
 
@@ -328,9 +315,12 @@ def evaluate_semantic(
     try:
         from tqdm import tqdm
     except ImportError:
-        def tqdm(it, **kw): return it  # fallback: no progress bar
+        def tqdm(it, **kw): return it
 
-    for row in tqdm(behaviors.iter_rows(named=True), total=len(behaviors), desc="Semantic eval"):
+    user_vecs = []
+    ground_truths = []
+
+    for row in tqdm(behaviors.iter_rows(named=True), total=len(behaviors), desc="Building queries"):
         impressions = row["impressions"] or []
         labels = row["labels"] or []
         ground_truth = {aid for aid, lbl in zip(impressions, labels) if lbl == 1}
@@ -348,15 +338,34 @@ def evaluate_semantic(
         if user_vec is None:
             n_no_history += 1
             continue
+            
+        user_vecs.append(user_vec)
+        ground_truths.append(ground_truth)
 
-        retrieved = retriever.retrieve_by_vector(user_vec, k=max_k)
-        for k in k_values:
-            recall_sums[k] += recall_at_k(retrieved, ground_truth, k)
-        n_evaluated += 1
-
-    if n_evaluated == 0:
+    if not user_vecs:
         print("  Warning: no impressions could be evaluated.")
         return {f"recall@{k}": 0.0 for k in k_values}
+
+    # Batch FAISS search (drops execution time from hours to seconds)
+    print(f"  Running FAISS batched search for {len(user_vecs):,} queries...")
+    query_matrix = np.vstack(user_vecs).astype(np.float32)
+    
+    # Optional chunking to avoid OOM on massive test sets
+    chunk_size = 50_000
+    all_indices = []
+    for i in tqdm(range(0, len(query_matrix), chunk_size), desc="FAISS search"):
+        chunk = query_matrix[i:i+chunk_size]
+        _, indices = retriever._index.search(chunk, max_k)
+        all_indices.append(indices)
+    
+    all_indices = np.vstack(all_indices)
+
+    print("  Computing Recall@K...")
+    for indices, gt in zip(all_indices, ground_truths):
+        retrieved = [retriever.article_ids[i] for i in indices if i >= 0]
+        for k in k_values:
+            recall_sums[k] += recall_at_k(retrieved, gt, k)
+        n_evaluated += 1
 
     results = {f"recall@{k}": recall_sums[k] / n_evaluated for k in k_values}
     print(f"\n[Semantic] Results on {dataset}/{split} (n={n_evaluated}, no_history={n_no_history}):")
