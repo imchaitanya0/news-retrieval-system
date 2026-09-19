@@ -482,3 +482,14 @@ Throughout the development and Kaggle deployment of this pipeline, we faced seve
 - **Numbers:** 
   - VRAM to RAM Transfer Size: `130,379 x 384 x 4 bytes` = ~200 MB.
   - Transfer Latency: ~0.2 seconds.
+
+### 7.8 Feature Store PyTorch CUDA OOM
+- **Error:** `torch.cuda.OutOfMemoryError: CUDA out of memory` during `feature_store.py` execution (Cell 18).
+- **Root Cause:** 
+  1. **Chunk Size:** The default chunk size tried to allocate ~1,500 queries simultaneously against 130K articles. `(1500 × 130379 × 4 bytes) ≈ 780 MB` per matrix, requiring ~2 GB per iteration when computing both main and recent semantic scores.
+  2. **Fragmentation & Gradients:** PyTorch’s autograd graph implicitly tracked operations, and the caching allocator became highly fragmented because `torch.cuda.empty_cache()` was not called within the loop.
+- **Solution:**
+  1. Enforced a `_SAFE_CHUNK = 256` limit to cap per-matrix VRAM at ~133 MB.
+  2. Wrapped the loop in `torch.no_grad()` to disable graph tracking.
+  3. Replaced `torch.tensor().cuda()` with `torch.as_tensor(..., device='cuda')` to eliminate an intermediate CPU float64 → GPU float32 round-trip.
+  4. Placed explicit `torch.cuda.empty_cache()` calls inside the loop after deleting intermediate tensors (`sc_all`, `sc_rec`) to release memory blocks back to the OS and prevent progressive fragmentation.

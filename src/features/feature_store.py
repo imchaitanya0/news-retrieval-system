@@ -269,27 +269,46 @@ def build_features(
     # ------------------------------------------------------------------
     print("  GPU batch semantic scoring (full + recent windows)...")
 
+    # Sanity check — how much VRAM is actually free right now?
+    if use_gpu:
+        free_b, total_b = torch.cuda.mem_get_info()
+        print(f"  VRAM free before scoring: {free_b/1e9:.2f} GB / {total_b/1e9:.2f} GB")
+
     all_cand_indices = []
     for row in all_rows:
         impressions = row.get("impressions") or []
         all_cand_indices.append([emb_id_to_idx.get(aid, -1) for aid in impressions])
 
-    all_sem_main   = []  # per impression: list of float
-    all_sem_recent = []  # per impression: list of float
+    all_sem_main   = []
+    all_sem_recent = []
 
-    for chunk_start in tqdm(range(0, n_behaviors, chunk_size), desc="GPU Batches"):
-        chunk_end = min(chunk_start + chunk_size, n_behaviors)
+    # Force small chunks — 256 rows × 130,379 cols × 4 B ≈ 133 MB per matrix
+    _SAFE_CHUNK = 256
+    _eff_chunk = min(chunk_size, _SAFE_CHUNK)
+
+    # Pre-move the article embedding matrix once; it is reused every iteration
+    emb_t = emb_gpu  # already on GPU as a torch tensor
+
+    for chunk_start in tqdm(range(0, n_behaviors, _eff_chunk), desc="GPU Batches"):
+        chunk_end = min(chunk_start + _eff_chunk, n_behaviors)
 
         if use_gpu:
-            # Full history semantic scores
-            uv_t   = torch.tensor(user_vecs_main[chunk_start:chunk_end]).cuda()
-            sc_all = torch.mm(uv_t, emb_gpu.T).cpu().numpy()
-            del uv_t
+            with torch.no_grad():
+                uv_t = torch.as_tensor(
+                    user_vecs_main[chunk_start:chunk_end],
+                    dtype=torch.float32, device='cuda',
+                )
+                sc_all = torch.mm(uv_t, emb_t.T).cpu().numpy()
+                del uv_t
 
-            # Short-term semantic scores
-            uv_r   = torch.tensor(user_vecs_recent[chunk_start:chunk_end]).cuda()
-            sc_rec = torch.mm(uv_r, emb_gpu.T).cpu().numpy()
-            del uv_r
+                uv_r = torch.as_tensor(
+                    user_vecs_recent[chunk_start:chunk_end],
+                    dtype=torch.float32, device='cuda',
+                )
+                sc_rec = torch.mm(uv_r, emb_t.T).cpu().numpy()
+                del uv_r
+
+            torch.cuda.empty_cache()
         else:
             sc_all = np.dot(user_vecs_main[chunk_start:chunk_end], emb_gpu.T)
             sc_rec = np.dot(user_vecs_recent[chunk_start:chunk_end], emb_gpu.T)
