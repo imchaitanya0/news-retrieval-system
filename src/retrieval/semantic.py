@@ -223,9 +223,27 @@ class SemanticRetriever:
     def load(self, path: Path) -> None:
         import faiss
         import os
-        cpu_index = faiss.read_index(str(path / "faiss.index"))
+
+        index_file = path / "faiss.index"
+        ids_file = path / "article_ids.pkl"
+
+        if not index_file.exists() or not ids_file.exists():
+            self._index = None
+            self.article_ids = []
+            print("  No cached index — will rebuild")
+            return
+
+        try:
+            cpu_index = faiss.read_index(str(index_file))
+        except Exception as e:
+            print(f"  Corrupt faiss.index ({e}); deleting and rebuilding")
+            index_file.unlink(missing_ok=True)
+            self._index = None
+            self.article_ids = []
+            return
+
         self._index = cpu_index
-        with open(path / "article_ids.pkl", "rb") as f:
+        with open(ids_file, "rb") as f:
             self.article_ids = pickle.load(f)
         
         use_gpu = (
@@ -315,7 +333,8 @@ def evaluate_semantic(
     retriever = SemanticRetriever()
     if (index_path / "faiss.index").exists():
         retriever.load(index_path)
-    else:
+        
+    if retriever._index is None:
         retriever.build(embeddings, article_ids)
         retriever.save(index_path)
 
