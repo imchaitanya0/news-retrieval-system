@@ -133,41 +133,69 @@ class BM25Retriever:
         return [self.article_ids[i] for i in indices]
 
     def search_batch(self, queries: list[str], k: int = 100,
-                     batch_size: int = 500) -> list[list[str]]:
-        """Batch top-k search. Returns list of article_id lists, one per query."""
-        if not queries:
-            return []
+                     batch_size: int = 256) -> list[list[str]]:
+        """Batch search using the sparse score matrix directly. No JAX, no numba."""
+        import numpy as np
+        from scipy import sparse
+        from tqdm import tqdm
 
-        if _USE_BM25S:
-            all_results = []
-            n_batches = (len(queries) + batch_size - 1) // batch_size
-            for b, i in enumerate(range(0, len(queries), batch_size)):
-                chunk = queries[i:i + batch_size]
-                q_tokens = bm25s.tokenize(chunk, lower=True, show_progress=False)
-                idxs, _ = self._index.retrieve(
-                    q_tokens, k=k, show_progress=False, n_threads=0,
-                )
-                for row in idxs:
-                    all_results.append(
-                        [self.article_ids[j] for j in row if j >= 0]
-                    )
-                del q_tokens, idxs
-                if b % 20 == 0:
-                    print(f'  batch {b+1}/{n_batches}', flush=True)
-            return all_results
+        if not _USE_BM25S:
+            # rank_bm25 fallback — per query (acceptable since it's already in memory)
+            return [self.search(q, k=k) for q in tqdm(queries, desc="BM25 per-query")]
 
-        # rank_bm25 fallback — still per-query, but reuse tokens
-        out = []
-        for q in queries:
-            tokens = _tokenize(q)
-            scores = self._index.get_scores(tokens)
-            if k < len(scores):
-                top = np.argpartition(-scores, k)[:k]
+        # Access bm25s internals: the eager sparse score matrix + vocab
+        # bm25s stores: self._index.scores (CSR), self._index.idf, self._index.vocab_dict
+        scores_matrix = self._index.scores          # scipy CSR [vocab, n_docs]
+        idf = self._index.idf                       # [vocab]
+        vocab = self._index.vocab_dict              # token -> id
+
+        # Ensure L2-ish normalisation matches bm25s: multiply cols by idf
+        # bm25s already applies idf at query time in retrieve(), so we do it here too
+        idf_diag = sparse.diags(idf)
+        weighted = idf_diag @ scores_matrix          # [vocab, n_docs]
+        weighted = weighted.tocsr()
+
+        n_queries = len(queries)
+        all_results = []
+
+        for start in tqdm(range(0, n_queries, batch_size), desc="BM25 batch"):
+            chunk = queries[start:start + batch_size]
+
+            # Tokenise batch -> sparse query matrix [batch, vocab]
+            rows, cols, data = [], [], []
+            for i, q in enumerate(chunk):
+                for tok in _tokenize(q):
+                    j = vocab.get(tok, -1)
+                    if j >= 0:
+                        rows.append(i); cols.append(j); data.append(1.0)
+            if not rows:
+                all_results.extend([[] for _ in chunk])
+                continue
+
+            Q = sparse.csr_matrix(
+                (data, (rows, cols)),
+                shape=(len(chunk), weighted.shape[0]),
+            )
+
+            # Batched sparse matmul -> dense scores [batch, n_docs]
+            S = (Q @ weighted).toarray()
+
+            # Top-k per row
+            if k < S.shape[1]:
+                part = np.argpartition(-S, k, axis=1)[:, :k]
+                # sort each row by score descending
+                for i in range(part.shape[0]):
+                    order = np.argsort(-S[i, part[i]])
+                    part[i] = part[i][order]
             else:
-                top = np.arange(len(scores))
-            top = top[np.argsort(-scores[top])]
-            out.append([self.article_ids[i] for i in top])
-        return out
+                part = np.argsort(-S, axis=1)
+
+            for row in part:
+                all_results.append([self.article_ids[j] for j in row if j >= 0])
+
+            del Q, S, part
+
+        return all_results
 
     # ------------------------------------------------------------------ #
     #  Save / Load                                                         #

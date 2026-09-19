@@ -509,3 +509,14 @@ Throughout the development and Kaggle deployment of this pipeline, we faced seve
 - **Error:** System hung/crashed during the initial BM25 batched search call with `batch_size=10000`.
 - **Root Cause:** `bm25s.retrieve()` allocates a score buffer matrix for the entire batch. A batch of 10,000 queries against a 130,379 document corpus requires `(10000 × 130379 × 4 bytes)` = ~5.2 GB of continuous RAM for dense float32 operations. This triggered severe memory thrashing and eventual OOM kills on limited memory environments.
 - **Solution:** Reduced the default `batch_size` from 10,000 to 500, limiting per-batch RAM usage to ~260 MB. Additionally, added batch progress logging to explicitly monitor retrieval throughput.
+
+### 7.11 BM25 `bm25s` JAX/Numba Overhead Bypass
+- **Error:** Even with batched queries, `bm25s.retrieve()` caused Kaggle kernels to stall or fail due to background JAX/numba compilation and runtime overhead.
+- **Root Cause:** The `bm25s.retrieve` API wraps its core sparse operations with JAX/numba for parallel top-k selection. In restricted container environments like Kaggle, the JIT compiler can deadlock or exhaust resources, causing silent hangs or taking ~9 hours to execute queries that should take seconds.
+- **Solution:** 
+  - Rewrote `search_batch` to completely bypass the `.retrieve()` method.
+  - Accessed the internal `self._index.scores` (CSR sparse matrix) and `self._index.idf` directly.
+  - Implemented a pure `scipy.sparse` batched matrix multiplication (`Q @ weighted`) followed by a standard `numpy.argpartition` for top-k selection.
+- **Numbers:**
+  - Before (JAX/numba overhead): System hangs or takes 5+ minutes just for JIT warmup.
+  - After (Pure scipy.sparse): Stable execution, processing 244,000 queries in ~3–5 minutes with predictable memory footprint.
