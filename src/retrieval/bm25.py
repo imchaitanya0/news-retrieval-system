@@ -133,14 +133,15 @@ class BM25Retriever:
         return [self.article_ids[i] for i in indices]
 
     def search_batch(self, queries: list[str], k: int = 100,
-                     batch_size: int = 10000) -> list[list[str]]:
+                     batch_size: int = 500) -> list[list[str]]:
         """Batch top-k search. Returns list of article_id lists, one per query."""
         if not queries:
             return []
 
         if _USE_BM25S:
             all_results = []
-            for i in range(0, len(queries), batch_size):
+            n_batches = (len(queries) + batch_size - 1) // batch_size
+            for b, i in enumerate(range(0, len(queries), batch_size)):
                 chunk = queries[i:i + batch_size]
                 q_tokens = bm25s.tokenize(chunk, lower=True, show_progress=False)
                 idxs, _ = self._index.retrieve(
@@ -151,6 +152,8 @@ class BM25Retriever:
                         [self.article_ids[j] for j in row if j >= 0]
                     )
                 del q_tokens, idxs
+                if b % 20 == 0:
+                    print(f'  batch {b+1}/{n_batches}', flush=True)
             return all_results
 
         # rank_bm25 fallback — still per-query, but reuse tokens

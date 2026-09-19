@@ -504,3 +504,8 @@ Throughout the development and Kaggle deployment of this pipeline, we faced seve
 - **Numbers:**
   - Before: ~35 it/s (~9+ hours runtime).
   - After: ~400+ it/s (~10 minutes runtime).
+
+### 7.10 BM25 Batched Retrieval OOM/Thrashing
+- **Error:** System hung/crashed during the initial BM25 batched search call with `batch_size=10000`.
+- **Root Cause:** `bm25s.retrieve()` allocates a score buffer matrix for the entire batch. A batch of 10,000 queries against a 130,379 document corpus requires `(10000 × 130379 × 4 bytes)` = ~5.2 GB of continuous RAM for dense float32 operations. This triggered severe memory thrashing and eventual OOM kills on limited memory environments.
+- **Solution:** Reduced the default `batch_size` from 10,000 to 500, limiting per-batch RAM usage to ~260 MB. Additionally, added batch progress logging to explicitly monitor retrieval throughput.
