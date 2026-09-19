@@ -132,6 +132,40 @@ class BM25Retriever:
 
         return [self.article_ids[i] for i in indices]
 
+    def search_batch(self, queries: list[str], k: int = 100,
+                     batch_size: int = 10000) -> list[list[str]]:
+        """Batch top-k search. Returns list of article_id lists, one per query."""
+        if not queries:
+            return []
+
+        if _USE_BM25S:
+            all_results = []
+            for i in range(0, len(queries), batch_size):
+                chunk = queries[i:i + batch_size]
+                q_tokens = bm25s.tokenize(chunk, lower=True, show_progress=False)
+                idxs, _ = self._index.retrieve(
+                    q_tokens, k=k, show_progress=False, n_threads=0,
+                )
+                for row in idxs:
+                    all_results.append(
+                        [self.article_ids[j] for j in row if j >= 0]
+                    )
+                del q_tokens, idxs
+            return all_results
+
+        # rank_bm25 fallback — still per-query, but reuse tokens
+        out = []
+        for q in queries:
+            tokens = _tokenize(q)
+            scores = self._index.get_scores(tokens)
+            if k < len(scores):
+                top = np.argpartition(-scores, k)[:k]
+            else:
+                top = np.arange(len(scores))
+            top = top[np.argsort(-scores[top])]
+            out.append([self.article_ids[i] for i in top])
+        return out
+
     # ------------------------------------------------------------------ #
     #  Save / Load                                                         #
     # ------------------------------------------------------------------ #
@@ -267,29 +301,34 @@ def evaluate_bm25(
     except ImportError:
         def tqdm(it, **kw): return it  # fallback: no progress bar
 
-    for row in tqdm(behaviors.iter_rows(named=True), total=len(behaviors), desc="BM25 eval"):
+    rows = list(behaviors.iter_rows(named=True))
+
+    def _history_to_text(row):
+        history = row["history"] if has_history else []
+        if isinstance(history, str):
+            history = history.split() if history else []
+        if not history:
+            ground_truth = {aid for aid, lbl in zip(row["impressions"] or [], row["labels"] or []) if lbl == 1}
+            history = list(ground_truth)
+        query = build_query_from_history(history, article_text_map, max_articles=max_history)
+        return query if query else ""
+
+    print("  Building queries...")
+    queries = [_history_to_text(row) for row in tqdm(rows, desc="Query strings")]
+
+    # Single batched retrieval call
+    print(f"  Batch BM25 scoring for {len(queries):,} queries (k={max_k}) ...")
+    all_preds = retriever.search_batch(queries, k=max_k)
+
+    for row, preds in tqdm(zip(rows, all_preds), total=len(rows), desc="BM25 eval"):
         impressions = row["impressions"] or []
         labels = row["labels"] or []
         ground_truth = {aid for aid, lbl in zip(impressions, labels) if lbl == 1}
         if not ground_truth:
             continue
-
-        # Build query from history
-        history = row["history"] if has_history else []
-        if isinstance(history, str):
-            # MIND history may come as a space-separated string if parsing missed it
-            history = history.split() if history else []
-        if not history:
-            # Fallback: treat known positives as pseudo-history
-            history = list(ground_truth)
-
-        query = build_query_from_history(history, article_text_map, max_articles=max_history)
-        if not query:
-            continue
-
-        retrieved = retriever.retrieve(query, k=max_k)
+            
         for k in k_values:
-            recall_sums[k] += recall_at_k(retrieved, ground_truth, k)
+            recall_sums[k] += recall_at_k(preds, ground_truth, k)
         n_evaluated += 1
 
     if n_evaluated == 0:

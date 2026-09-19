@@ -493,3 +493,14 @@ Throughout the development and Kaggle deployment of this pipeline, we faced seve
   2. Wrapped the loop in `torch.no_grad()` to disable graph tracking.
   3. Replaced `torch.tensor().cuda()` with `torch.as_tensor(..., device='cuda')` to eliminate an intermediate CPU float64 → GPU float32 round-trip.
   4. Placed explicit `torch.cuda.empty_cache()` calls inside the loop after deleting intermediate tensors (`sc_all`, `sc_rec`) to release memory blocks back to the OS and prevent progressive fragmentation.
+
+### 7.9 BM25 Evaluation Loop Extremely Slow
+- **Error:** `evaluate_bm25` took 9+ hours to process EB-NeRD validation split (244,647 queries).
+- **Root Cause:** The `evaluate_bm25` loop iteratively tokenized and queried the index one row at a time. This introduced massive Python loop overhead (244k distinct calls to the C++ backend), negating the performance benefits of the inverted index.
+- **Solution:** 
+  1. Added a `search_batch` method to `BM25Retriever` to process queries in chunks of 10,000.
+  2. Extracted query construction from the loop, precomputing all history texts.
+  3. Executed a single batched `.search_batch(queries, k=max_k)` call, reducing C-level calls from 244,647 to just 25.
+- **Numbers:**
+  - Before: ~35 it/s (~9+ hours runtime).
+  - After: ~400+ it/s (~10 minutes runtime).
