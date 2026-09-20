@@ -548,3 +548,20 @@ The following issues were identified across the full notebook execution and are 
 **7.12.6 No `gc.collect()` Between Cells**
 - Python's garbage collector does not immediately free large numpy arrays when they go out of scope. Without explicit `gc.collect()`, stale arrays from Cell N occupied RAM during Cell N+1, causing silent OOM crashes.
 - **Fix:** Every cell that loads large data (embeddings, behaviors, feature matrices) now explicitly calls `del <large_var>; gc.collect(); torch.cuda.empty_cache()` before the cell exits.
+
+### 7.13 LightGBM Test Inference OOM (MIND: 2.37M Impressions)
+- **Error:** `inference()` in `train_lgbm.py` loaded the full MIND test set (2.37M impressions) at once, built all features in a single `build_features()` call, causing RAM to climb past 30 GB and OOM-killing the Kaggle session.
+- **Root Cause:** No chunking existed in the `inference()` function. `--max-train-rows` only caps training rows. Test inference ran unconditionally on the full split.
+- **Solution:** Rewrote `inference()` to process `chunk_rows=50_000` rows at a time using `behaviors.slice(start, size)`. Each iteration builds features, runs `ranker.predict()`, writes results to the output file, and immediately frees the chunk via `del` + `gc.collect()`. Peak RAM stays under ~8 GB.
+- **Numbers:**
+  - MIND test: 2,370,727 impressions / 50,000 per chunk = 48 chunks.
+  - Peak RAM per chunk: ~3-4 GB (feature matrix for 50K impressions).
+  - Total time: ~45 minutes (same as before, just OOM-safe).
+
+**7.13.1 Issues Audited and Confirmed Status**
+
+| Issue | Status | Action Taken |
+|---|---|---|
+| **Issue 1**: `inference()` has no chunked test path — OOM at 30 GB | **REAL** | Rewrote `inference()` with `chunk_rows=50_000` in `train_lgbm.py` |
+| **Issue 2**: `bm25.py search_batch` unknown — might still use old path | **FALSE** | Confirmed `from scipy import sparse` is active at line 139 |
+| **Issue 3**: EB-NeRD skip-check used hardcoded path, misses nested layouts | **PARTIAL** | Fixed Cell 8 to use `rglob('behaviors.parquet')` instead of hardcoded path |

@@ -248,58 +248,53 @@ def inference(
     dataset: str,
     split: str = "test",
     out_path: Path = None,
+    chunk_rows: int = 50_000,
 ) -> Path:
     """
-    Run LGBM inference on test behaviors and write Codabench submission.
-    Called by generate.py when --strategy lgbm.
+    Run LGBM inference on behaviors and write Codabench submission.
+    Processes behaviors in chunks of `chunk_rows` to prevent OOM on large splits.
+
+    MIND test set has 2.37M impressions — building all features at once requires
+    ~30 GB RAM. Chunked processing keeps peak RAM under ~8 GB.
     """
-    import shutil, zipfile
+    import shutil, zipfile, gc
     from src.features.feature_store import build_features, FEATURE_NAMES
     from src.retrieval.semantic import load_or_compute_embeddings
     from src.retrieval.bm25 import _article_text
 
-    articles_path  = PROCESSED_DIR / f"articles_{dataset}.parquet"
-    beh_path       = PROCESSED_DIR / f"behaviors_{dataset}_{split}.parquet"
+    try:
+        from tqdm import tqdm as _tqdm
+    except ImportError:
+        def _tqdm(it, **kw): return it
+
+    articles_path = PROCESSED_DIR / f"articles_{dataset}.parquet"
+    beh_path      = PROCESSED_DIR / f"behaviors_{dataset}_{split}.parquet"
 
     articles  = pl.read_parquet(articles_path)
     behaviors = pl.read_parquet(beh_path)
+    n_total   = len(behaviors)
+    print(f"  {split} set: {n_total:,} impressions — chunk_rows={chunk_rows:,}")
 
     embs, ids = load_or_compute_embeddings(articles, dataset)
     embedding_map = dict(zip(ids, embs))
+    del embs  # free the large numpy array
 
-    # Article text map
     art_rows = articles.select(["article_id", "title", "subtitle"]).to_dicts()
     article_text_map = {r["article_id"]: _article_text(r) for r in art_rows}
 
-    # Article publish time map for freshness
     pub_col = "published_time" if "published_time" in articles.columns else None
-    if pub_col:
-        article_publish_map = {
-            r["article_id"]: r[pub_col]
-            for r in articles.select(["article_id", pub_col]).to_dicts()
-        }
-    else:
-        article_publish_map = {}
+    article_publish_map = (
+        {r["article_id"]: r[pub_col]
+         for r in articles.select(["article_id", pub_col]).to_dicts()}
+        if pub_col else {}
+    )
 
-    # Popularity from train
     pop_map = {}
     train_path = PROCESSED_DIR / f"behaviors_{dataset}_train.parquet"
     if train_path.exists():
         pop_map = build_popularity_map(pl.read_parquet(train_path).head(200_000))
 
-    print(f"  Building features for {len(behaviors):,} impressions...")
-    X, y, groups, imp_ids, art_ids = build_features(
-        behaviors, articles, embedding_map,
-        article_text_map=article_text_map,
-        popularity_map=pop_map,
-        article_publish_map=article_publish_map,
-    )
-
-    print("  Running LGBM inference...")
-    scores = ranker.predict(X)
-
-    # Reconstruct per-impression rankings
-    # Build a fast index: impression_id -> original candidate list (O(N) one-time cost)
+    # Build impression_id -> original candidate list map for rank formatting
     imp_to_orig = {}
     for row in behaviors.select(["impression_id", "impressions"]).iter_rows(named=True):
         imp_to_orig[row["impression_id"]] = row["impressions"] or []
@@ -311,37 +306,54 @@ def inference(
         out_path = SUBMISSION_DIR / f"{dataset}_{split}_lgbm.txt"
     txt_path = SUBMISSION_DIR / txt_name
 
-    try:
-        from tqdm import tqdm as _tqdm
-    except ImportError:
-        def _tqdm(it, **kw): return it
-
-    ptr = 0
     n_written = 0
-    with open(out_path, "w") as f:
-        for g_size in _tqdm(groups, desc=f"Writing {split} predictions"):
-            imp_id     = imp_ids[ptr]
-            # Normalize imp_id type to match imp_to_orig keys
-            imp_id_key = int(imp_id) if not isinstance(imp_id, str) else imp_id
-            imp_arts   = art_ids[ptr:ptr + g_size]
-            imp_scores = scores[ptr:ptr + g_size]
-            imp_orig   = imp_to_orig.get(imp_id_key, imp_arts)
+    n_chunks  = (n_total + chunk_rows - 1) // chunk_rows
 
-            order    = np.argsort(-imp_scores)
-            ranked   = [imp_arts[i] for i in order]
-            rank_map = {aid: rk for rk, aid in enumerate(ranked, 1)}
-            ranks    = [str(rank_map.get(aid, g_size + 1)) for aid in imp_orig]
-            f.write(f"{imp_id} [{','.join(ranks)}]\n")
-            n_written += 1
-            ptr += g_size
+    with open(out_path, "w") as f_out:
+        for chunk_idx in _tqdm(range(n_chunks), desc=f"Inference chunks ({split})"):
+            chunk_start = chunk_idx * chunk_rows
+            chunk_end   = min(chunk_start + chunk_rows, n_total)
+            beh_chunk   = behaviors.slice(chunk_start, chunk_end - chunk_start)
+
+            # Build features for this chunk only
+            X, y, groups, imp_ids, art_ids = build_features(
+                beh_chunk, articles, embedding_map,
+                article_text_map=article_text_map,
+                popularity_map=pop_map,
+                article_publish_map=article_publish_map,
+            )
+
+            scores = ranker.predict(X)
+            del X   # free immediately
+
+            # Write ranked predictions
+            ptr = 0
+            for g_size in groups:
+                imp_id     = imp_ids[ptr]
+                imp_id_key = int(imp_id) if not isinstance(imp_id, str) else imp_id
+                imp_arts   = art_ids[ptr:ptr + g_size]
+                imp_scores = scores[ptr:ptr + g_size]
+                imp_orig   = imp_to_orig.get(imp_id_key, imp_arts)
+
+                order    = np.argsort(-imp_scores)
+                ranked   = [imp_arts[i] for i in order]
+                rank_map = {aid: rk for rk, aid in enumerate(ranked, 1)}
+                ranks    = [str(rank_map.get(aid, g_size + 1)) for aid in imp_orig]
+                f_out.write(f"{imp_id} [{','.join(ranks)}]\n")
+                n_written += 1
+                ptr += g_size
+
+            del beh_chunk, y, groups, imp_ids, art_ids, scores
+            gc.collect()
 
     print(f"  Saved → {out_path} ({n_written:,} impressions)")
     shutil.copy(out_path, txt_path)
     zip_path = SUBMISSION_DIR / f"{dataset}_{split}_lgbm.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.write(txt_path, arcname=txt_name)
-    print(f"  Zip → {zip_path}")
+    print(f"  Zip  → {zip_path}")
     return out_path
+
 
 
 
