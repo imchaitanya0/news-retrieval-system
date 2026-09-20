@@ -513,10 +513,38 @@ Throughout the development and Kaggle deployment of this pipeline, we faced seve
 ### 7.11 BM25 `bm25s` JAX/Numba Overhead Bypass
 - **Error:** Even with batched queries, `bm25s.retrieve()` caused Kaggle kernels to stall or fail due to background JAX/numba compilation and runtime overhead.
 - **Root Cause:** The `bm25s.retrieve` API wraps its core sparse operations with JAX/numba for parallel top-k selection. In restricted container environments like Kaggle, the JIT compiler can deadlock or exhaust resources, causing silent hangs or taking ~9 hours to execute queries that should take seconds.
-- **Solution:** 
-  - Rewrote `search_batch` to completely bypass the `.retrieve()` method.
+- **Solution:** Rewrote `search_batch` to completely bypass the `.retrieve()` method.
   - Accessed the internal `self._index.scores` (CSR sparse matrix) and `self._index.idf` directly.
   - Implemented a pure `scipy.sparse` batched matrix multiplication (`Q @ weighted`) followed by a standard `numpy.argpartition` for top-k selection.
 - **Numbers:**
   - Before (JAX/numba overhead): System hangs or takes 5+ minutes just for JIT warmup.
-  - After (Pure scipy.sparse): Stable execution, processing 244,000 queries in ~3–5 minutes with predictable memory footprint.
+  - After (Pure scipy.sparse): Stable execution, processing 244,000 queries in ~3-5 minutes with predictable memory footprint.
+
+### 7.12 Notebook-Level Bugs and OOM Issues in Kaggle
+
+The following issues were identified across the full notebook execution and are now resolved in `notebooks/final.ipynb`:
+
+**7.12.1 Notebook Cell Labels Mismatched with Content**
+- The old `final.ipynb` had cells labeled "Compute MIND embeddings" but actually executing EB-NeRD download code, making it impossible to debug failures.
+- **Fix:** Rewrote the entire notebook with 29 sequentially labeled cells, each with a clear comment block explaining inputs, outputs, timing, and OOM risks.
+
+**7.12.2 JAX CUDA Memory Reservation**
+- Even after `pip uninstall jax`, if JAX was imported earlier in the session, it retains a CUDA device context that prevents other CUDA consumers (FAISS, PyTorch) from allocating contiguous blocks.
+- **Fix:** JAX is now uninstalled as the very first step in Cell 4, before any other package install. Cell 4 also verifies JAX is absent via `importlib.util.find_spec('jax')`.
+
+**7.12.3 `PYTORCH_CUDA_ALLOC_CONF` Not Set**
+- Without `expandable_segments:True`, PyTorch cannot release partial VRAM blocks back to the OS, causing progressive VRAM fragmentation across cells in a long session.
+- **Fix:** Cell 3 now sets `os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'` before any GPU work starts.
+
+**7.12.4 Feature Store VRAM OOM Due to Large Chunks**
+- The GPU feature scoring loop allocated `chunk_size x 130,379 x 4 bytes = 780 MB` per matrix. Default chunk_size was ~1500, requiring ~2 GB per iteration.
+- **Fix:** Hardcoded `_SAFE_CHUNK = 256` inside `feature_store.py`. Wrapped loop in `torch.no_grad()`. Used `torch.as_tensor(..., device='cuda')` to avoid intermediate CPU roundtrips. Added `torch.cuda.empty_cache()` inside the loop.
+- **Numbers:** `256 x 130379 x 4 bytes = 133 MB` per matrix call. Safe on T4 (15 GB VRAM).
+
+**7.12.5 NRMS OOM Due to Full Training Set**
+- Training NRMS on the full 2.2M MIND behaviors required building a vocabulary of all seen words and batching 2.2M impressions through the GPU. This hits T4 VRAM and/or kills the Kaggle CPU RAM budget.
+- **Fix:** Pass `--max-train-rows 50000` and `--max-val-rows 5000`. This limits training to 50K impressions (enough to converge) and validation to 5K (fast feedback per epoch). Full model still trains all 3 epochs.
+
+**7.12.6 No `gc.collect()` Between Cells**
+- Python's garbage collector does not immediately free large numpy arrays when they go out of scope. Without explicit `gc.collect()`, stale arrays from Cell N occupied RAM during Cell N+1, causing silent OOM crashes.
+- **Fix:** Every cell that loads large data (embeddings, behaviors, feature matrices) now explicitly calls `del <large_var>; gc.collect(); torch.cuda.empty_cache()` before the cell exits.
