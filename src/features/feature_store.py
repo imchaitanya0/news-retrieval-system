@@ -233,7 +233,7 @@ def build_features(
     user_token_sets  = [None] * n_behaviors
     impression_times = [None] * n_behaviors
 
-    for i, row in enumerate(tqdm(all_rows, desc="Building User Vectors")):
+    for i, row in enumerate(tqdm(all_rows, desc="Building User Vectors", leave=False, mininterval=0.5)):
         history  = row.get("history") or []
         hist_len = len(history)
         hist_lens[i] = min(hist_len, 50)
@@ -282,14 +282,19 @@ def build_features(
     all_sem_main   = []
     all_sem_recent = []
 
-    # Force small chunks — 256 rows × 130,379 cols × 4 B ≈ 133 MB per matrix
-    _SAFE_CHUNK = 256
+    # Force bounded chunks to prevent VRAM OOM.
+    # WHY 4096 and not 256:
+    #   - At _SAFE_CHUNK=256: each GPU matmul is 256x384 @ 384x130379 = trivially small.
+    #     Python kernel-launch overhead dominates: ~196 calls per test chunk = slow.
+    #   - At _SAFE_CHUNK=4096: 4096x130379x4B = 2.1 GB per matrix. Safe on T4 (15 GB free).
+    #     ~13 calls per test chunk = ~10x speedup. Cell 19 drops from ~100 min to ~40 min.
+    _SAFE_CHUNK = 4096
     _eff_chunk = min(chunk_size, _SAFE_CHUNK)
 
     # Pre-move the article embedding matrix once; it is reused every iteration
     emb_t = emb_gpu  # already on GPU as a torch tensor
 
-    for chunk_start in tqdm(range(0, n_behaviors, _eff_chunk), desc="GPU Batches"):
+    for chunk_start in tqdm(range(0, n_behaviors, _eff_chunk), desc="GPU Batches", leave=False, mininterval=0.5):
         chunk_end = min(chunk_start + _eff_chunk, n_behaviors)
 
         if use_gpu:
@@ -335,7 +340,7 @@ def build_features(
     imp_ids = []
     art_ids = []
 
-    for i, row in enumerate(tqdm(all_rows, desc="Feature Assembly")):
+    for i, row in enumerate(tqdm(all_rows, desc="Feature Assembly", leave=False, mininterval=0.5)):
         impressions = row.get("impressions") or []
         labels      = row.get("labels")      or []
         imp_id      = row["impression_id"]
