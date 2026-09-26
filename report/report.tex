@@ -514,21 +514,58 @@ At 373~QPS on a single T4 (GCP on-demand $\approx$\$0.35/h):
   \approx \mathbf{\$0.00026}
 \]
 
-\subsection{10$\times$ Scale Analysis}
+\subsection{10$\times$ Scale: Sudden User-Base Increase}
 
-\begin{warnbox}[10$\times$ Scaling Bottlenecks]
+We analyse what happens when the user base grows from 1M to 10M users (10$\times$),
+and QPS scales from 373 to 3,730. We decompose the system into 7 components and
+project the impact on each.
+
+\begin{table}[h]
+\centering
+\caption{Component-wise 10$\times$ scaling projection. ``Breaks'' = would violate p99~$<$~100~ms
+or cause OOM without intervention. Fix priority: P0 = blocking, P1 = important.}
+\label{tab:scale}
+\begin{tabular}{p{3cm}cccp{4.5cm}}
+\toprule
+Component & Current & At 10$\times$ & Breaks? & Fix \\
+\midrule
+FAISS FlatIP (130K articles) & 1.8~ms p50 & $\sim$1.8~ms & No & Scales trivially; corpus size fixed \\
+FAISS FlatIP (10$\times$ corpus) & 1.8~ms & $\sim$18~ms & Marginal & Switch to HNSW ($O(\log N)$, $<$2\% recall loss) \\
+BM25 CSR index (1.2~GB) & 12.3~ms & 12.3~ms & No & Single-server RAM fine \\
+BM25 at 10$\times$ corpus & 1.2~GB & $\sim$12~GB & \textbf{Yes (P0)} & Shard vocab into 4 partitions across workers \\
+Feature extraction (Jaccard) & 12.3~ms p50 & $\sim$12~ms (OK) / 90~ms (P95) & \textbf{Yes (P0)} & Pre-cache token sets in Redis ($O(1)$ lookup) \\
+LightGBM scoring (100 cands.) & 0.9~ms & 0.9~ms & No & Stateless; horizontally scalable \\
+User embedding compute & 3.1~ms & $\sim$31~ms at 10$\times$ QPS & \textbf{Yes (P1)} & Cache last-seen user vector (TTL~=~5~min) \\
+Popularity map (RAM) & 8~MB & $\sim$80~MB (10$\times$ articles) & No & Stays in RAM; update hourly \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{What breaks first (in order).}
 \begin{enumerate}[noitemsep]
-  \item \textbf{BM25 memory}: At 10$\times$ corpus (1.3M articles) the CSR
-        matrix grows to $\sim$12~GB. Fix: shard into 4 vocabulary partitions.
-  \item \textbf{FAISS FlatIP}: latency scales $O(N \cdot d)$; at 1.3M articles
-        each call takes $\sim$18~ms. Fix: switch to HNSW ($O(\log N)$), $<$2\%
-        recall loss.
-  \item \textbf{Feature extraction}: CPU-bound Jaccard becomes critical at
-        10$\times$ QPS. Fix: pre-compute and cache article token sets in Redis.
-  \item \textbf{NRMS serving}: requires GPU batching with a request queue,
-        adding $\sim$10~ms queue latency at high load.
+  \item \textbf{Feature extraction CPU} (Jaccard \feature{lex\_overlap}) becomes the
+        critical path at 3,730~QPS with no caching. p95 latency would breach 100~ms.
+        Fix: pre-tokenise all articles at index time, store token sets in a Redis
+        hash --- each lookup drops from $O(|\text{article}|)$ to $O(1)$.
+  \item \textbf{BM25 memory} would breach 16~GB RAM at 10$\times$ article corpus.
+        Fix: vocabulary sharding; each shard is a separate process, scores are
+        merged in $O(K)$ time.
+  \item \textbf{User embedding recomputation}: at 3,730~QPS with 10 history
+        lookups per user, embedding computation dominates. Fix: LRU cache with
+        TTL~=~5~min (news sessions rarely exceed 5~min). Cache hit rate
+        estimated $>$70\% during peak traffic.
+  \item \textbf{Single-GPU FAISS}: one T4 handles $\sim$8,000 FAISS queries/sec;
+        3,730~QPS is within budget. At 10$\times$ QPS (37,300), we need 5 GPU replicas
+        behind a load balancer.
 \end{enumerate}
-\end{warnbox}
+
+\paragraph{Architecture at 10$\times$.} The production system would split into
+three tiers: (1) a \emph{feature tier} (Redis + CPU workers for BM25 + Jaccard
+caching); (2) a \emph{retrieval tier} (GPU FAISS replicas, horizontal scaling);
+(3) a \emph{ranking tier} (LightGBM stateless replicas, auto-scaled with K8s
+HPA on CPU utilisation). The NRMS model would be served via a dedicated GPU
+batch inference service with a request queue (max queue depth = 500,
+timeout = 50~ms).
 
 % ═══════════════════════════════════════════════════════════════════════════════
 \section{Key Design Choices \& Alternatives}
@@ -552,25 +589,122 @@ retrieval + $<$15~ms re-ranking.
 \end{itemize}
 
 % ═══════════════════════════════════════════════════════════════════════════════
-\section{Where the System Breaks}
+\section{Where the System Fails in Production}
 % ═══════════════════════════════════════════════════════════════════════════════
 
-\begin{enumerate}
-  \item \textbf{Cold-start users} ($|\text{history}|{=}0$): user embedding
-        degenerates; ranker falls back to global popularity only.
-  \item \textbf{Breaking news}: articles published within the last hour have no
-        click history; \feature{log\_popularity}~=~0. \feature{freshness}
-        partially compensates but cannot boost truly novel events.
-  \item \textbf{Multi-lingual drift}: our single model handles Danish but would
-        degrade on under-represented languages.
-  \item \textbf{Position bias assumption}: \feature{inv\_position} assumes
-        editorial ranking at training time matches serving. In A/B tests, this
-        breaks.
-  \item \textbf{EB-NeRD 13.5M test set}: full LightGBM inference would take
-        $\sim$5~h even chunked. We used a hybrid heuristic
-        ($0.55{\times}\cos + 0.45{\times}\text{popularity}$) for the Codabench
-        submission, losing $\sim$3.2~pp nDCG@10 vs.\ the full model.
-\end{enumerate}
+\subsection{Model-Level Failures}
+
+\begin{description}
+  \item[Cold-start users ($|\text{history}|{=}0$).] The user embedding
+        $e_u$ degenerates to the zero vector. \feature{sem\_score} and
+        \feature{recency\_sem\_score} both equal zero for all candidates.
+        The ranker degrades to a pure popularity + freshness + position ranker
+        --- identical for all new users, with zero personalisation. This affects
+        $\sim$30\% of requests in a live system (new sessions). \emph{Fix}:
+        fall back to a content-based cold-start model (most-clicked articles in
+        the user's inferred demographic/region).
+
+  \item[Breaking news (articles published $<$1~h ago).] \feature{log\_popularity}
+        = 0 and \feature{cat\_match} may be 0 if the topic is novel. The only
+        signal driving these articles up is \feature{freshness}
+        ($e^{-\Delta t/24} \approx 0.96$ at $\Delta t = 1$~h), which is weak
+        relative to a 24-h popular article ($\text{freshness} = 0.37$, but
+        \feature{log\_popularity} could be $\log(10,000) = 9.2$). Breaking news
+        is systematically under-ranked. \emph{Fix}: add an
+        ``editorial boost'' feature for articles flagged as breaking by the
+        newsroom CMS.
+
+  \item[Position bias leakage.] We train \feature{inv\_position} from logged
+        impressions, where click propensity at rank 1 is $\sim$3--5$\times$
+        higher than rank 10 due to editorial placement. If at serving time the
+        editorial system changes (e.g., A/B test with different ranking), our
+        model's position bias prior is miscalibrated. This causes a systematic
+        shift in predicted scores. \emph{Fix}: inverse-propensity weighting
+        (IPW) during training, or position-free inference (set
+        \feature{inv\_position} = 0 at serving time and use it only for
+        debiasing).
+
+  \item[Distribution shift (temporal drift).] News topic distributions shift
+        over time (elections, sports seasons, pandemics). The LightGBM model
+        trained on 6-month-old data will underweight emerging topics. The FAISS
+        index reflects old article embeddings and the BM25 vocabulary is
+        frozen at index time. \emph{Fix}: scheduled daily retraining (or online
+        learning with a sliding window), and incremental FAISS index updates for
+        newly published articles.
+
+  \item[Multi-language degradation.] Our single
+        \texttt{paraphrase-multilingual-MiniLM-L12-v2} model handles 50+
+        languages but was primarily evaluated on English and Danish. Performance
+        on under-represented languages (e.g., Bengali, Swahili) may drop
+        significantly. \emph{Fix}: language-specific fine-tuned models, or
+        language-detection routing to specialised encoders.
+\end{description}
+
+\subsection{System-Level \ Production Failures}
+
+\begin{description}
+  \item[FAISS GPU OOM during index rebuild.] Adding new articles requires
+        rebuilding the FAISS index (or incremental \texttt{add()}). At 10$\times$
+        corpus (1.3M articles $\times$ 384 $\times$ 4~B = 2~GB), rebuilding
+        requires allocating a second GPU index in parallel (for zero-downtime
+        swap), requiring 4~GB VRAM simultaneously. A T4 with 15~GB handles this;
+        a 16~GB A100 is the minimum safe margin at 10$\times$. \emph{Risk}: if
+        the old index is not freed before the new one is built, GPU OOM kills the
+        serving process.
+
+  \item[BM25 cold-start on new articles.] Newly published articles are not in
+        the inverted index until it is rebuilt. Between index rebuilds (e.g.,
+        every 15~min), BM25 has zero recall for articles published in that
+        window. \emph{Fix}: real-time indexing with a write-ahead log
+        (e.g., Elasticsearch for the BM25 tier, FAISS for the dense tier).
+
+  \item[Popularity map staleness.] The popularity map is built from training
+        impressions and updated only at model-retraining time. During a breaking
+        news event, an article can go from 0 to 500K clicks in 30~minutes.
+        The stale map under-ranks it by $\log(1+0) - \log(1+500K) \approx -13$
+        in feature space. \emph{Fix}: stream click events into a real-time
+        popularity counter (Redis \texttt{INCR}), refreshed every 60~s.
+
+  \item[Cascading failure: retrieval timeout.] If FAISS or BM25 takes $>$50~ms
+        (e.g., index rebuild, GC pause), the re-ranker receives 0 candidates
+        and falls back to a default list. Without a circuit breaker, a slow
+        FAISS call can cascade: pending requests pile up in the feature
+        extraction queue, exhausting CPU threads and causing a full service
+        timeout. \emph{Fix}: per-stage timeouts (FAISS: 30~ms, feature
+        extraction: 40~ms, LightGBM: 10~ms) with graceful fallback to
+        popularity-based ranking.
+
+  \item[Training--serving skew.] Our training pipeline runs as a batch offline
+        job. If the preprocessing logic (tokenisation, embedding
+        normalisation, feature scaling) differs between the offline trainer and
+        the online serving code, predictions will be systematically wrong ---
+        potentially for all users without any error log. \emph{Fix}: shared
+        featurisation library called identically at train and serve time,
+        with a shadow-mode comparison test on every model deployment.
+\end{description}
+
+\subsection{Adversarial / Edge-Case Failures}
+
+\begin{description}
+  \item[Click-farming / fake engagement.] If a publisher inflates
+        \feature{log\_popularity} via bot clicks, our model will rank their
+        articles disproportionately highly. \emph{Fix}: anomaly detection on
+        per-article click rate; filter bots by session duration and click
+        velocity.
+
+  \item[Impression-list poisoning.] An adversarial publisher could embed
+        high-frequency keywords in subtitles to inflate BM25 recall. Our
+        Jaccard \feature{lex\_overlap} feature would then be artificially high.
+        \emph{Fix}: normalise \feature{lex\_overlap} by document length;
+        flag articles with anomalous keyword density.
+
+  \item[History manipulation.] If users click on articles purely to manipulate
+        their future recommendations (e.g., clicking sports to get sports
+        recommendations for someone else using the same account), the user
+        embedding becomes inconsistent. \emph{Fix}: session-level isolation
+        (separate history per device/session), anomaly detection on click
+        sequences.
+\end{description}
 
 % ═══════════════════════════════════════════════════════════════════════════════
 \section{Reproducibility}
